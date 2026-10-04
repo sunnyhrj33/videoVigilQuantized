@@ -12,37 +12,107 @@ models:
   yolo11s_openvino_fp32: models/fp32/yolo11s_fp32_openvino_model   # folder with .xml + .bin + metadata.yaml
   yolo11n_int8:       models/openvino/yolo11n_int8_openvino_model   # folder with .xml + .bin + metadata.yaml
   yolo11s_int8:       models/openvino/yolo11s_int8_openvino_model   # folder with .xml + .bin + metadata.yaml
+  yolo11n_int8_480:   models/openvino/yolo11n_int8_480_openvino_model  # INT8 @480, CHIRLA-calibrated (export_yolo_int8.py) – fastest
 
 # ── Detection Parameters ──────────────────────
 detection:
   conf_threshold: 0.35         # Minimum confidence score (0.0–1.0)
   iou_threshold: 0.45          # NMS IoU threshold (0.0–1.0)
-  target_classes: [0]          # COCO class IDs to detect; 0 = person, [] = all classes
-  max_detections: 300          # Hard cap on detections per frame
+  # COCO IDs: 0 = person, 24 = backpack, 26 = handbag, 63 = laptop; [] = all classes
+  target_classes: [0, 24, 26, 63]
+  person_conf_threshold: 0.50  # Person boxes below this are ignored by identity/security
+                               # (e.g. an office chair detected as a person at ~0.5)
+  max_detections: 100          # Hard cap on detections per frame
   imgsz: 640                   # Inference image size (pixels); 320/480/640/1280
 
-# ── Tracking Parameters ──────────────────────
+# ── Tracking & Tracklet Settings ─────────────
 tracking:
   tracker: bytetrack           # Tracker backend: bytetrack | botsort | ocsort | strongsort | trackformer
+                               # (bytetrack ≈20 ms/frame faster than botsort on this CPU)
   track_high_thresh: 0.5       # High-confidence detection threshold for new tracks
   track_low_thresh: 0.1        # Low-confidence threshold (second association)
   new_track_thresh: 0.6        # Min score to initialise a brand-new track
   track_buffer: 30             # Frames to keep a lost track alive
   match_thresh: 0.8            # IoU threshold for track–detection matching
   min_hits: 3                  # Minimum detections before a track is confirmed
+  tracklet_window: 10          # Store up to 10 past crop embeddings per track ID
+  min_tracklet_crops: 4        # Minimum samples needed before the open-set decision
 
-# ── Re-Identification Parameters ─────────────
+# ── Re-ID & Open-Set Classification ──────────
 reid:
   enabled: true
   # Available models: osnet_ain_x1_0, osnet_x1_0, osnet_x0_25, resnet50, resnet101
   # fastraid, transreid, vitreid (requires torchreid / fast-reid / timm)
   model: osnet_ain_x1_0
-  weights: auto                # Path to .pt weights or "auto" to download
+  # Re-ID-trained checkpoint (file, or folder holding <model>_*.pth). Without it torchreid
+  # falls back to ImageNet weights, which are NOT trained to tell people apart.
+  # osnet_ain_x1_0 (MSMT17, combineall) – torchreid model zoo:
+  #   python -m gdown 1SigwBE6mPdqiJMqhuIY4aqC7--5CsMal -O models/reid/osnet_ain_x1_0_msmt17.pth
+  weights: models/reid
   device: cpu                  # Device: cpu | cuda | AUTO (OpenVINO)
-  reid_thresh: 0.4             # Cosine-similarity threshold; lower = stricter match
-  max_reid_distance: 0.25      # Max feature distance to associate a lost track (tightened)
-  frame_interval: 3            # Re-ID feature extraction every N frames; raise for more FPS
-  feature_update_rate: 0.9     # EMA rate for feature embedding update (0–1)
+  # Identity mode:
+  #   tracklet – enrolled gallery + 5 tracklet features + open-set classifier
+  #   naive    – enrolled gallery, single-frame nearest prototype (baseline for Demo 2)
+  #   legacy   – original runtime EMA gallery (random R-IDs, no enrollment)
+  mode: tracklet
+  gallery_file: enrolled_gallery/gallery_prototypes.pkl
+  open_set_model: enrolled_gallery/open_set_lr.json
+  reid_thresh: 0.45            # Single-frame cosine-similarity threshold (naive baseline)
+  open_set_p_threshold: 0.50   # P(Known) ≥ this → Employee, else UNKNOWN VISITOR
+  decision_smoothing: 0.5      # EMA weight on the previous P(Known) of a track (0 = no smoothing)
+  decision_hysteresis: 0.10    # A resolved KNOWN/UNKNOWN flips only past threshold ± this
+  max_reid_distance: 0.25      # Legacy mode: max feature distance to re-associate a track
+  frame_interval: 3            # Sample a crop every N frames per track while identifying
+  settled_interval: 30         # …only every N frames once the identity is settled
+  settled_margin: 0.20         # "settled" = P(Known) at least this far from the threshold
+  max_embeds_per_frame: 2      # Re-ID budget: crops embedded per frame (biggest FPS lever)
+  feature_update_rate: 0.9     # Legacy mode: EMA rate for feature embedding update (0–1)
+  crop_quality:                # Crops failing these are not added to a tracklet
+    min_height: 64             # px
+    min_conf: 0.45             # detector confidence
+    min_sharpness: 20.0        # variance of Laplacian on a 64×128 resize
+
+# ── Spatial Security & Object Zones ───────────
+# Polygons are normalised [x, y] (0–1) image coordinates.
+# Top-level polygons apply to every camera; per_camera overrides them. A zone is a real
+# place, so CHIRLA zones are set per camera – a generic default box would cover random
+# desks in every view. Example default (disabled):
+#   restricted_desk_area: [[0.60, 0.40], [0.95, 0.40], [0.95, 0.90], [0.60, 0.90]]
+security_zones:
+  enabled: false               # Restricted-zone intrusion checks (toggle live in the console)
+  per_camera:
+    camera_4:                  # desk with the monitored laptop (Demo 3, from make_demo_clips.py)
+      restricted_desk_area: [[0.26, 0.287], [0.723, 0.287], [0.723, 0.97], [0.26, 0.97]]
+  monitored_assets:
+    - class_name: "laptop"
+      zone_stay_limit_seconds: 5
+      allow_unknown_interaction: false
+    - class_name: "backpack"
+      zone_stay_limit_seconds: 5
+      allow_unknown_interaction: false
+    - class_name: "handbag"
+      zone_stay_limit_seconds: 5
+      allow_unknown_interaction: false
+
+assets:
+  overlap_thresh: 0.30         # Area(person ∩ asset) / Area(asset) to count as contact
+  move_thresh: 0.35            # Asset centre shift (× its box diagonal) to count as moved
+  anchor_frames: 15            # Frames an asset must be seen before it is "registered"
+  max_missing_frames: 90       # Forget an asset not seen for this many frames
+
+# ── CHIRLA protocol ───────────────────────────
+chirla:
+  root: C:/CHIRLA
+  employees: [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 14]   # enrolled
+  visitors: [8, 13, 15, 16, 18, 19, 24, 25, 26]          # never enrolled
+  crops_per_employee: 5
+  # People change clothes between recording days, so employees are enrolled per day
+  # ("morning entrance"): enrolled_gallery/<date>/gallery_prototypes.pkl. The app
+  # loads the gallery matching a CHIRLA video's date automatically.
+  train_days: ["2023-06-02", "2023-06-08", "2023-06-13"]                 # visitors 8, 18, 19, 24
+  test_days: ["2023-07-26", "2023-12-01", "2023-12-04", "2023-12-05"]   # visitors 13, 15, 16, 25, 26
+  demo_day: "2023-07-26"       # default gallery for webcam / non-CHIRLA sources
+  min_gap_after_enroll: 600    # frames (20 s) skipped after an employee's enrollment cut-off
 
 # ── OpenVINO / Hardware ───────────────────────
 openvino:
@@ -75,4 +145,5 @@ visualisation:
 output:
   save_video: false            # Write annotated video to disk
   output_dir: output/          # Directory for saved videos / logs
+  audit_log: output/audit_log.csv   # Forensic CSV of identity / zone / asset events
   log_level: INFO              # Python logging level: DEBUG | INFO | WARNING | ERROR

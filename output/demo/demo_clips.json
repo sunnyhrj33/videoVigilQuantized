@@ -1,0 +1,81 @@
+{
+  "demo1": {
+    "file": "demo1_known_persistence__camera_2_2023-07-26-13_26_38.mp4",
+    "source": "seq_020/camera_2",
+    "date": "2023-07-26",
+    "start_frame": 8959,
+    "frames": 750,
+    "focus": "emp_03",
+    "coverage": 0.9,
+    "longest_gap_s": 1.3,
+    "employees": [
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      11
+    ],
+    "visitors": []
+  },
+  "demo2": {
+    "file": "demo2_unknown_rejection__camera_3_2023-07-26-13_22_08.mp4",
+    "source": "seq_020/camera_3",
+    "date": "2023-07-26",
+    "start_frame": 847,
+    "frames": 750,
+    "focus": "visitor 16",
+    "coverage": 1.0,
+    "employees": [
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      9,
+      11
+    ],
+    "visitors": [
+      16
+    ]
+  },
+  "demo3": {
+    "file": "demo3_asset_interaction__camera_4_2023-06-08-12_29_33.mp4",
+    "source": "seq_004/camera_4",
+    "date": "2023-06-08",
+    "start_frame": 750,
+    "frames": 750,
+    "focus": "visitor 8 at laptop",
+    "object_conf": 0.91,
+    "suggested_zone": {
+      "camera_4": [
+        [
+          0.26,
+          0.287
+        ],
+        [
+          0.723,
+          0.287
+        ],
+        [
+          0.723,
+          0.899
+        ],
+        [
+          0.26,
+          0.899
+        ]
+      ]
+    },
+    "employees": [
+      2,
+      4,
+      7
+    ],
+    "visitors": [
+      8
+    ]
+  }
+}

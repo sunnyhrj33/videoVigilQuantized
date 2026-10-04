@@ -8,9 +8,12 @@
 torch>=2.1.0                # Deep learning framework (CPU/GPU support)
 torchvision>=0.16.0         # Computer vision utilities and models
 torchreid>=0.2.5            # Re-ID models: OSNet, ResNet, TransReID
+gdown>=5.0                  # torchreid import dependency; also downloads Re-ID weights
+tensorboard>=2.15           # torchreid import dependency (older versions fail to import)
 
 # ─── Object Detection & Tracking ──────────────────────────────────────────────────────
 ultralytics>=8.3.0          # YOLOv11 detection + native trackers (ByteTrack, BoTSORT)
+lap>=0.5.12                 # Linear assignment used by Ultralytics trackers
 openvino>=2024.1.0          # Intel's optimized inference runtime (INT8, FP32 quantization)
 
 # ─── Kalman Filtering (for Official Tracker Implementations) ─────────────────────────

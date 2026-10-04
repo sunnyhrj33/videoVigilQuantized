@@ -23,7 +23,20 @@ import cv2
 import numpy as np
 import yaml
 
+from chirla import camera_key, day_gallery_path, parse_video_name, source_date
 from official_trackers import OCSORTOfficial, StrongSORTOfficial, TrackFormerOfficial
+from open_set import (STATUS_KNOWN, STATUS_PENDING, STATUS_UNKNOWN, Identity,
+                      OpenSetClassifier, PrototypeGallery, TrackletManager, display_name)
+from security import AssetMonitor, AuditLogger, Clock, ZoneMonitor, zone_name_pretty
+
+# BGR colours for the security overlay
+COL_KNOWN = (60, 200, 60)
+COL_UNKNOWN = (0, 140, 255)
+COL_ALERT = (40, 40, 230)
+COL_PENDING = (160, 160, 160)
+COL_ASSET = (230, 220, 0)
+COL_ZONE = (0, 215, 255)
+PERSON_CLASS = 0
 
 # Auto-discover FastReID if available
 _fast_reid_paths = [
@@ -223,8 +236,14 @@ class ReIDExtractor:
       • VitREID (Vision Transformer) via timm
     """
 
-    def __init__(self, model_name: str = "osnet_x0_25", device: str = "cpu"):
+    _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def __init__(self, model_name: str = "osnet_x0_25", device: str = "cpu",
+                 weights: Optional[str] = None, backend: str = "auto"):
+        """backend: 'auto' (OpenVINO IR if exported, else PyTorch) | 'openvino' | 'torch'."""
         self._extractor = None
+        self._ov_model = None
         self._device = device
         self._model_name = model_name
         self._framework = self._detect_framework(model_name)
@@ -233,11 +252,24 @@ class ReIDExtractor:
         try:
             if self._framework == "torchreid":
                 import torchreid
+                model_path = self._resolve_weights(model_name, weights)
+                ov_xml = (Path(model_path).parent / f"{model_name}_openvino" / f"{model_name}.xml"
+                          if model_path else None)
+                if backend in ("auto", "openvino") and ov_xml is not None and ov_xml.exists():
+                    import openvino as ov
+                    self._ov_model = ov.Core().compile_model(str(ov_xml), "CPU",
+                                                             {"PERFORMANCE_HINT": "LATENCY"})
+                    logger.info("✓ Re-ID extractor loaded (OpenVINO): %s [%s]", model_name, ov_xml.name)
+                    return
+                if backend == "openvino":
+                    raise FileNotFoundError(f"OpenVINO Re-ID model not found: {ov_xml}")
                 self._extractor = torchreid.utils.FeatureExtractor(
                     model_name=model_name,
+                    model_path=model_path,
                     device=device,
                 )
-                logger.info("✓ Re-ID extractor loaded (torchreid): %s on %s", model_name, device)
+                logger.info("✓ Re-ID extractor loaded (torchreid): %s on %s [%s]", model_name, device,
+                            f"Re-ID weights {Path(model_path).name}" if model_path else "ImageNet weights only")
             elif self._framework == "fastraid":
                 try:
                     from fast_reid.fastreid.modeling import build_model
@@ -266,6 +298,25 @@ class ReIDExtractor:
             self._fallback_used = True
 
     @staticmethod
+    def _resolve_weights(model_name: str, weights: Optional[str]) -> str:
+        """
+        Return a Re-ID-trained checkpoint for this model, or "" for torchreid's
+        ImageNet initialisation. `weights` may be a file or a folder of
+        checkpoints named '<model_name>_*.pth' (e.g. models/reid/).
+        """
+        if not weights or weights == "auto":
+            weights = "models/reid"
+        p = Path(weights)
+        if p.is_dir():
+            matches = sorted(p.glob(f"{model_name}_*.pth"))
+            p = matches[0] if matches else None
+        if p is not None and p.is_file() and p.name.startswith(model_name):
+            return str(p)
+        logger.warning("No Re-ID-trained weights for %s (looked in %s) – using ImageNet weights; "
+                       "identity matching will be weak.", model_name, weights)
+        return ""
+
+    @staticmethod
     def _detect_framework(model_name: str) -> str:
         """Detect which framework a model name belongs to."""
         if model_name.startswith("osnet") or model_name.startswith("resnet"):
@@ -284,6 +335,9 @@ class ReIDExtractor:
         if bgr_crop is None or bgr_crop.size == 0:
             return np.zeros(512, dtype=np.float32)
 
+        if self._ov_model is not None:
+            return self.extract_batch([bgr_crop])[0]
+
         if self._extractor is not None:
             rgb = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
             import torch
@@ -291,6 +345,33 @@ class ReIDExtractor:
                 feat = self._extractor([rgb])
             return feat[0].cpu().numpy().flatten()
 
+        return self._histogram_feature(bgr_crop)
+
+    def extract_batch(self, bgr_crops: List[np.ndarray]) -> np.ndarray:
+        """Return an (n, d) feature matrix for a list of BGR crops (one forward pass)."""
+        if not bgr_crops:
+            return np.zeros((0, 512), dtype=np.float32)
+        if self._ov_model is not None:
+            from PIL import Image
+            # Same preprocessing as torchreid.FeatureExtractor: PIL bilinear 256×128, ImageNet norm
+            batch = np.stack([
+                np.asarray(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)).resize((128, 256), Image.BILINEAR),
+                           dtype=np.float32)
+                for c in bgr_crops
+            ])
+            batch = ((batch / 255.0 - self._MEAN) / self._STD).transpose(0, 3, 1, 2)
+            out = self._ov_model(np.ascontiguousarray(batch, dtype=np.float32))
+            return np.asarray(out[self._ov_model.output(0)]).reshape(len(bgr_crops), -1)
+        if self._extractor is not None:
+            rgbs = [cv2.cvtColor(c, cv2.COLOR_BGR2RGB) for c in bgr_crops]
+            import torch
+            with torch.no_grad():
+                feats = self._extractor(rgbs)
+            return feats.cpu().numpy().reshape(len(bgr_crops), -1)
+        return np.stack([self._histogram_feature(c) for c in bgr_crops])
+
+    @staticmethod
+    def _histogram_feature(bgr_crop: np.ndarray) -> np.ndarray:
         # Fallback: 64-dim colour histogram feature
         resized = cv2.resize(bgr_crop, (64, 128))
         hists = []
@@ -323,6 +404,8 @@ class DetectionEngine:
         self.classes = det.get("target_classes", [0]) or None
         self.imgsz = det.get("imgsz", 640)
         self.max_det = det.get("max_detections", 300)
+        self.person_conf = float(det.get("person_conf_threshold", 0.5))
+        self.zones_enabled = bool(cfg.get("security_zones", {}).get("enabled", True))
 
         self.show_labels = vis.get("show_labels", True)
         self.show_conf = vis.get("show_confidence", True)
@@ -343,6 +426,25 @@ class DetectionEngine:
         self._custom_tracker = None  # For custom tracker implementations
         self._initialize_tracker()
 
+        # Security layer: enrolled-gallery identity, zones, assets, audit log
+        self._identity_mode = reid_cfg.get("mode", "tracklet")
+        self._tracklets: Optional[TrackletManager] = None
+        self.gallery_info = "—"
+        self._zones = ZoneMonitor(cfg)
+        self._zones.configure(None)
+        self._assets = AssetMonitor(cfg)
+        self._clock = Clock()
+        self._camera_id = "Cam_00"
+        self._audit: Optional[AuditLogger] = None
+        self._audit_path = cfg.get("output", {}).get("audit_log", "output/audit_log.csv")
+        self._logged_identity: Dict[int, Tuple[str, Optional[str]]] = {}
+        self._zone_alert_t: Dict[Tuple[int, str], float] = {}
+        self._banners: deque = deque(maxlen=3)        # (text, expires_at_sec)
+        self._alert_count = 0
+        # UI event feed: (seq_no, level, stamp, camera, text); read via events_since()
+        self._events: deque = deque(maxlen=500)
+        self._event_no = 0
+
         # Re-ID
         self._reid_enabled = reid_cfg.get("enabled", True)
         self._reid_model_name: Optional[str] = None
@@ -360,6 +462,7 @@ class DetectionEngine:
 
         self._model = None
         self._model_path: Optional[str] = None
+        self._model_imgsz: Optional[int] = None
 
         # FPS
         self._fps_buffer: deque = deque(maxlen=30)
@@ -383,6 +486,7 @@ class DetectionEngine:
                     self._reid_extractor_cache[model_name] = ReIDExtractor(
                         model_name=model_name,
                         device=self._reid_cfg.get("device", "cpu"),
+                        weights=self._reid_cfg.get("weights", "auto"),
                     )
                 self._reid_extractor = self._reid_extractor_cache[model_name]
                 logger.info("✓ Re-ID model set to: %s", model_name)
@@ -392,6 +496,7 @@ class DetectionEngine:
                     max_dist=self._reid_cfg.get("max_reid_distance", 0.6),
                 )
                 self._reid_frame_interval = max(1, int(self._reid_cfg.get("frame_interval", 3)))
+                self._init_open_set()
             except Exception as e:
                 logger.error("Failed to load Re-ID model '%s': %s. Using fallback.", model_name, str(e))
                 # Use a fallback extractor
@@ -401,6 +506,95 @@ class DetectionEngine:
                         device=self._reid_cfg.get("device", "cpu"),
                     )
                 self._reid_extractor = self._reid_extractor_cache["fallback"]
+
+    def _init_open_set(self):
+        """Load the enrolled gallery + open-set classifier for the current Re-ID model."""
+        self._tracklets = None
+        gallery_file = Path(self._reid_cfg.get("gallery_file", "enrolled_gallery/gallery_prototypes.pkl"))
+        if not gallery_file.exists():
+            logger.warning("Enrolled gallery %s not found – run build_gallery.py. "
+                           "Falling back to legacy runtime Re-ID.", gallery_file)
+            return
+        gallery = PrototypeGallery.load(gallery_file)
+        self.gallery_info = f"{gallery.meta.get('date', 'default')} · {len(gallery)} enrolled"
+        built_with = gallery.meta.get("model")
+        if built_with and built_with != self._reid_model_name:
+            logger.warning("Gallery was built with %s but Re-ID model is %s – embeddings are not "
+                           "comparable. Rebuild the gallery; using legacy runtime Re-ID.",
+                           built_with, self._reid_model_name)
+            return
+        classifier = OpenSetClassifier(self._reid_cfg.get("open_set_model"))
+        cfg = dict(self.cfg)
+        cfg["reid"] = {**self._reid_cfg, "mode": self._identity_mode}
+        self._tracklets = TrackletManager(gallery, classifier, self._reid_extractor.extract_batch, cfg)
+
+    def set_identity_mode(self, mode: str):
+        """'tracklet' (open-set), 'naive' (single-frame baseline) or 'legacy' (runtime EMA IDs)."""
+        with self._engine_lock:
+            self._identity_mode = mode
+            if self._tracklets is not None and mode != "legacy":
+                self._tracklets.set_mode(mode)
+            self._logged_identity.clear()
+            logger.info("✓ Identity mode: %s", mode)
+
+    def skip_frame(self):
+        """A source frame was dropped (real-time playback): keep clock / timers in step."""
+        with self._engine_lock:
+            self._frame_idx += 1
+
+    def set_open_set_threshold(self, p: float):
+        """P(Known) cut-off between Employee and UNKNOWN (live)."""
+        self._reid_cfg["open_set_p_threshold"] = float(p)
+        if self._tracklets is not None:
+            self._tracklets.p_thresh = float(p)
+
+    def set_source(self, source, fps: float = 30.0):
+        """Bind a new video source: camera ID, clock, per-camera zones; reset all state."""
+        with self._engine_lock:
+            cam, start = parse_video_name(str(source)) if isinstance(source, str) else (None, None)
+            self._camera_id = cam or ("Webcam" if not isinstance(source, str) else "Cam_00")
+            self._clock = Clock(start=start, fps=fps if fps and fps > 1 else 30.0)
+            self._zones.configure(camera_key(str(source)))
+            self._frame_idx = 0
+            self._assets.reset()
+            if self._tracklets is not None:
+                self._tracklets.set_gallery(self._gallery_for(source))
+            self._logged_identity.clear()
+            self._zone_alert_t.clear()
+            self._banners.clear()
+            self._alert_count = 0
+            self._emit("info", f"Source started · {self._camera_id} · gallery {self.gallery_info}")
+            self.reset_trails()
+            self._reset_native_tracker()
+            logger.info("Source bound: camera=%s zones=%s gallery=%s", self._camera_id,
+                        list(self._zones.zones), self.gallery_info)
+
+    def _gallery_for(self, source) -> PrototypeGallery:
+        """Same-day enrollment: a CHIRLA video uses the gallery enrolled on its recording date."""
+        default = Path(self._reid_cfg.get("gallery_file", "enrolled_gallery/gallery_prototypes.pkl"))
+        date = source_date(str(source)) if isinstance(source, str) else None
+        path = day_gallery_path(default, date)
+        if date and not path.exists():
+            logger.warning("No gallery enrolled for %s – using default %s", date, default)
+            path = default
+        gallery = PrototypeGallery.load(path)
+        self.gallery_info = f"{gallery.meta.get('date', 'default')} · {len(gallery)} enrolled"
+        return gallery
+
+    def _reset_native_tracker(self):
+        predictor = getattr(self._model, "predictor", None) if self._model is not None else None
+        for trk in getattr(predictor, "trackers", None) or []:
+            try:
+                trk.reset()
+            except Exception:
+                pass
+        if self._custom_tracker is not None:
+            self._initialize_tracker()
+
+    def close(self):
+        if self._audit is not None:
+            self._audit.close()
+            self._audit = None
 
     def set_tracker(self, tracker_name: str):
         """
@@ -485,6 +679,14 @@ class DetectionEngine:
             self._model = YOLO(str(p), task="detect")
             self._model_path = str(p)
             self._model_key = model_key
+            # Static OpenVINO exports must be fed the size they were exported at.
+            self._model_imgsz = None
+            meta = p / "metadata.yaml" if p.is_dir() else None
+            if meta is not None and meta.exists():
+                sz = (yaml.safe_load(meta.read_text()) or {}).get("imgsz")
+                if sz:
+                    self._model_imgsz = int(sz[0] if isinstance(sz, (list, tuple)) else sz)
+                    logger.info("Model input size: %d", self._model_imgsz)
 
             # Re-create tracker instance to clear any stale tracker state.
             self._initialize_tracker()
@@ -515,7 +717,7 @@ class DetectionEngine:
                     conf=self.conf,
                     iou=self.iou,
                     classes=self.classes,
-                    imgsz=self.imgsz,
+                    imgsz=self._model_imgsz or self.imgsz,
                     max_det=self.max_det,
                     verbose=False,
                 )
@@ -611,7 +813,7 @@ class DetectionEngine:
                     conf=self.conf,
                     iou=self.iou,
                     classes=self.classes,
-                    imgsz=self.imgsz,
+                    imgsz=self._model_imgsz or self.imgsz,
                     max_det=self.max_det,
                     tracker=f"{self._tracker_name}.yaml",
                     persist=True,
@@ -638,19 +840,24 @@ class DetectionEngine:
             annotated = frame.copy()
             stats = {"detections": 0, "tracks": 0}
 
+            dets: List[Tuple[Tuple[int, int, int, int], float, int, int]] = []
+            names: Dict[int, str] = {}
             if results and results[0].boxes is not None:
                 boxes = results[0].boxes
-                n = len(boxes)
-                stats["detections"] = n
-
-                for i in range(n):
-                    xyxy = boxes.xyxy[i].cpu().numpy().astype(int)
-                    conf_val = float(boxes.conf[i].cpu())
-                    cls_id = int(boxes.cls[i].cpu())
-                    cls_name = results[0].names.get(cls_id, str(cls_id))
+                names = results[0].names
+                for i in range(len(boxes)):
+                    x1, y1, x2, y2 = (int(v) for v in boxes.xyxy[i].cpu().numpy())
                     tid = int(boxes.id[i].cpu()) if boxes.id is not None else -1
+                    dets.append(((x1, y1, x2, y2), float(boxes.conf[i].cpu()),
+                                 int(boxes.cls[i].cpu()), tid))
+                stats["detections"] = len(dets)
+                stats["tracks"] = sum(1 for d in dets if d[3] >= 0)
 
-                    x1, y1, x2, y2 = xyxy
+            if self._reid_enabled and self._identity_mode != "legacy" and self._tracklets is not None:
+                self._annotate_security(frame, annotated, dets, names, stats)
+            else:
+                for (x1, y1, x2, y2), conf_val, cls_id, tid in dets:
+                    cls_name = names.get(cls_id, str(cls_id))
                     colour = _colour(tid)
 
                     # Re-ID
@@ -686,7 +893,6 @@ class DetectionEngine:
                     # Label
                     label_parts = []
                     if self.show_labels:
-                        cls_name = results[0].names.get(cls_id, str(cls_id))
                         label_parts.append(cls_name)
                     if self.show_conf:
                         label_parts.append(f"{conf_val:.2f}")
@@ -709,9 +915,6 @@ class DetectionEngine:
                                     self.font_scale, (255, 255, 255), 1,
                                     cv2.LINE_AA)
 
-                if boxes.id is not None:
-                    stats["tracks"] = int(boxes.id.numel())
-
             # ── FPS overlay ───────────────────────────────────────────────────
             now = time.perf_counter()
             dt = now - self._t_prev
@@ -727,6 +930,178 @@ class DetectionEngine:
                             0.8, (0, 255, 100), 2, cv2.LINE_AA)
 
             return annotated, stats
+
+    # ── Security layer (identity · zones · assets · audit) ─────────────────────
+
+    def _annotate_security(self, frame: np.ndarray, annotated: np.ndarray,
+                           dets: list, names: Dict[int, str], stats: dict):
+        h, w = frame.shape[:2]
+        self._clock.set_frame(self._frame_idx)
+        t_sec = self._clock.seconds
+
+        persons = [d for d in dets if d[2] == PERSON_CLASS and d[3] >= 0 and d[1] >= self.person_conf]
+        objects = [(names.get(d[2], str(d[2])), d[0]) for d in dets if d[2] != PERSON_CLASS]
+        idents = self._tracklets.update(frame, self._frame_idx,
+                                        [(tid, box, conf) for box, conf, _, tid in persons])
+
+        polys = self._zones.pixel_polygons(w, h) if self.zones_enabled else {}
+        for name, poly in polys.items():
+            self._draw_dashed_poly(annotated, poly, COL_ZONE)
+            x, y = poly[:, 0].min(), poly[:, 1].min()
+            self._draw_label(annotated, zone_name_pretty(name).replace("_", " "), (x, y), COL_ZONE, (0, 0, 0))
+
+        person_info, person_zone, people = [], {}, []
+        counts = {STATUS_KNOWN: 0, STATUS_UNKNOWN: 0, STATUS_PENDING: 0}
+        for box, _, _, tid in persons:
+            ident = idents.get(tid, Identity())
+            counts[ident.status] += 1
+            zones_in = self._zones.zones_containing(box, w, h) if polys else []
+            person_zone[tid] = zones_in[0] if zones_in else None
+            intrusion = ident.status == STATUS_UNKNOWN and bool(zones_in)
+            people.append({"tid": tid, "status": ident.status, "confidence": ident.confidence,
+                           "name": (display_name(ident.label) if ident.status == STATUS_KNOWN
+                                    else "UNKNOWN" if ident.status == STATUS_UNKNOWN else "Identifying…"),
+                           "crops": ident.n_crops, "zone": zone_name_pretty(zones_in[0]) if zones_in else "",
+                           "intrusion": intrusion})
+
+            self._log_identity(tid, ident)
+            if intrusion:
+                for z in zones_in:
+                    self._zone_alert(tid, ident, z, t_sec)
+
+            colour = (COL_ALERT if intrusion else COL_KNOWN if ident.status == STATUS_KNOWN
+                      else COL_UNKNOWN if ident.status == STATUS_UNKNOWN else COL_PENDING)
+            self._draw_trail(annotated, tid, box, colour)
+            thick = self.box_thick + (1 if intrusion else 0)
+            cv2.rectangle(annotated, box[:2], box[2:], colour, thick)
+            self._draw_label(annotated, self._identity_text(tid, ident), box[:2], colour, (255, 255, 255))
+            person_info.append((tid, box, ident.status, ident.label))
+
+        for ev in self._assets.update(self._frame_idx, t_sec, objects, person_info):
+            ident = idents.get(ev.track_id, Identity())
+            zone = person_zone.get(ev.track_id)
+            name = ev.asset.class_name.capitalize()
+            tag = {"possession": f"{name}_Possession_{self._log_name(ident)}",
+                   "displaced_unknown": f"{name}_Displaced",
+                   "unknown_interaction": f"{name}_Unknown_Interaction"}[ev.kind]
+            self._audit_log(ev.track_id, ident, zone_name_pretty(zone) if zone else "None", tag)
+            if ev.kind != "possession":
+                self._raise_banner(ev.text, t_sec)
+            else:
+                self._emit("asset", ev.text)
+
+        for a in self._assets.assets:
+            if a.last_seen != self._frame_idx:
+                continue
+            col = COL_ALERT if a.state == "ALERT" else COL_ASSET
+            cv2.rectangle(annotated, a.box[:2], a.box[2:], col, self.box_thick)
+            state = "ALERT" if a.state == "ALERT" else a.state
+            self._draw_label(annotated, f"{a.class_name.capitalize()}: {state}", a.box[:2], col, (0, 0, 0))
+
+        self._draw_banners(annotated, t_sec)
+        stats.update(known=counts[STATUS_KNOWN], unknown=counts[STATUS_UNKNOWN],
+                     pending=counts[STATUS_PENDING], alerts=self._alert_count,
+                     camera=self._camera_id, time=self._clock.stamp(), people=people,
+                     assets=[(a.class_name, a.state) for a in self._assets.assets
+                             if a.last_seen == self._frame_idx])
+
+    def _identity_text(self, tid: int, ident: Identity) -> str:
+        suffix = f" | T{tid}" if self.show_tid else ""
+        if ident.status == STATUS_PENDING:
+            need = self._tracklets.min_crops if self._tracklets else 0
+            return f"Identifying {ident.n_crops}/{need}{suffix}"
+        name = display_name(ident.label) if ident.status == STATUS_KNOWN else "UNKNOWN"
+        return f"{name} | Conf: {ident.confidence:.2f}{suffix}"
+
+    @staticmethod
+    def _log_name(ident: Identity) -> str:
+        if ident.status == STATUS_KNOWN and ident.label:
+            return ident.label.replace("emp_", "Emp_")
+        return "UNKNOWN" if ident.status == STATUS_UNKNOWN else "PENDING"
+
+    def _audit_log(self, tid: int, ident: Identity, zone: str = "None", asset: str = "None"):
+        if self._audit is None:
+            self._audit = AuditLogger(self._audit_path)
+        self._audit.log(self._clock.stamp(), self._camera_id, tid, self._log_name(ident),
+                        ident.status, ident.confidence, zone, asset)
+
+    def _log_identity(self, tid: int, ident: Identity):
+        """Log a track when its identity is first resolved or changes."""
+        if ident.status == STATUS_PENDING:
+            return
+        key = (ident.status, ident.label if ident.status == STATUS_KNOWN else None)
+        if self._logged_identity.get(tid) != key:
+            self._logged_identity[tid] = key
+            self._audit_log(tid, ident)
+            who = display_name(ident.label) if ident.status == STATUS_KNOWN else "UNKNOWN visitor"
+            self._emit("identity", f"T{tid} identified as {who} (conf {ident.confidence:.2f})")
+
+    def _zone_alert(self, tid: int, ident: Identity, zone: str, t_sec: float, cooldown: float = 10.0):
+        last = self._zone_alert_t.get((tid, zone))
+        if last is not None and t_sec - last < cooldown:
+            return
+        self._zone_alert_t[(tid, zone)] = t_sec
+        self._audit_log(tid, ident, zone_name_pretty(zone), "None")
+        self._raise_banner("Intrusion Alert: Unregistered Person in Restricted Area", t_sec)
+
+    def _emit(self, level: str, text: str):
+        """Push an event to the UI feed (level: alert | identity | asset | info)."""
+        self._event_no += 1
+        self._events.append((self._event_no, level, self._clock.stamp(), self._camera_id, text))
+
+    def events_since(self, last_no: int) -> list:
+        """Events newer than last_no (thread-safe snapshot for the UI)."""
+        return [e for e in list(self._events) if e[0] > last_no]
+
+    def _raise_banner(self, text: str, t_sec: float, duration: float = 4.0):
+        self._emit("alert", text)
+        self._alert_count += 1
+        # One banner per alert text; a repeat just extends it.
+        for i, (old, _) in enumerate(self._banners):
+            if old == text:
+                del self._banners[i]
+                break
+        self._banners.append((text, t_sec + duration))
+        logger.warning("ALERT [%s %s] %s", self._camera_id, self._clock.stamp(), text)
+
+    def _draw_banners(self, img: np.ndarray, t_sec: float):
+        active = [b for b in self._banners if b[1] >= t_sec]
+        y = 40
+        for text, _ in active[-2:]:
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+            x = max(10, (img.shape[1] - tw) // 2)
+            cv2.rectangle(img, (x - 12, y - th - 12), (x + tw + 12, y + 10), COL_ALERT, -1)
+            cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+            y += th + 30
+
+    def _draw_trail(self, img: np.ndarray, tid: int, box, colour):
+        if not self.show_trail:
+            return
+        self._trails[tid].append(((box[0] + box[2]) // 2, box[3]))
+        pts = list(self._trails[tid])
+        for j in range(1, len(pts)):
+            alpha = j / len(pts)
+            cv2.line(img, pts[j - 1], pts[j], tuple(int(c * alpha) for c in colour),
+                     max(1, self.box_thick - 1))
+
+    def _draw_label(self, img: np.ndarray, text: str, org, bg, fg):
+        x, y = int(org[0]), int(org[1])
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, self.font_scale, 1)
+        y = max(y, th + 6)
+        cv2.rectangle(img, (x, y - th - 6), (x + tw + 4, y), bg, -1)
+        cv2.putText(img, text, (x + 2, y - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                    self.font_scale, fg, 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_dashed_poly(img: np.ndarray, poly: np.ndarray, colour, dash: int = 14, thick: int = 2):
+        pts = [tuple(int(v) for v in p) for p in poly]
+        for a, b in zip(pts, pts[1:] + pts[:1]):
+            length = float(np.hypot(b[0] - a[0], b[1] - a[1]))
+            for s in range(0, int(length), dash * 2):
+                e = min(s + dash, length)
+                p1 = (int(a[0] + (b[0] - a[0]) * s / length), int(a[1] + (b[1] - a[1]) * s / length))
+                p2 = (int(a[0] + (b[0] - a[0]) * e / length), int(a[1] + (b[1] - a[1]) * e / length))
+                cv2.line(img, p1, p2, colour, thick, cv2.LINE_AA)
 
     # ── Utility ───────────────────────────────────────────────────────────────
 

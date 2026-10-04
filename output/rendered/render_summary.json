@@ -1,0 +1,84 @@
+[
+  {
+    "clip": "demo1_known_persistence__camera_2_2023-07-26-13_26_38.mp4",
+    "mode": "tracklet",
+    "frames": 750,
+    "seconds": 211,
+    "output": "output\\rendered\\demo1_known_persistence__tracklet.mp4",
+    "tracks_resolved": 18,
+    "known": 13,
+    "unknown": 5,
+    "known_names": {
+      "Emp 01": 3,
+      "Emp 11": 2,
+      "Emp 06": 1,
+      "Emp 10": 4,
+      "Emp 02": 1,
+      "Emp 07": 1,
+      "Emp 03": 1
+    },
+    "alerts": {},
+    "asset_events": []
+  },
+  {
+    "clip": "demo2_unknown_rejection__camera_3_2023-07-26-13_22_08.mp4",
+    "mode": "naive",
+    "frames": 750,
+    "seconds": 213,
+    "output": "output\\rendered\\demo2_unknown_rejection__naive.mp4",
+    "tracks_resolved": 20,
+    "known": 20,
+    "unknown": 0,
+    "known_names": {
+      "Emp 09": 7,
+      "Emp 11": 3,
+      "Emp 01": 5,
+      "Emp 06": 1,
+      "Emp 02": 1,
+      "Emp 04": 2,
+      "Emp 03": 1
+    },
+    "alerts": {},
+    "asset_events": []
+  },
+  {
+    "clip": "demo2_unknown_rejection__camera_3_2023-07-26-13_22_08.mp4",
+    "mode": "tracklet",
+    "frames": 750,
+    "seconds": 225,
+    "output": "output\\rendered\\demo2_unknown_rejection__tracklet.mp4",
+    "tracks_resolved": 16,
+    "known": 7,
+    "unknown": 9,
+    "known_names": {
+      "Emp 09": 1,
+      "Emp 11": 2,
+      "Emp 06": 1,
+      "Emp 02": 2,
+      "Emp 01": 1
+    },
+    "alerts": {
+      "Intrusion Alert: Unregistered Person in Restricted Area": 6
+    },
+    "asset_events": []
+  },
+  {
+    "clip": "demo3_asset_interaction__camera_4_2023-06-08-12_29_33.mp4",
+    "mode": "tracklet",
+    "frames": 750,
+    "seconds": 154,
+    "output": "output\\rendered\\demo3_asset_interaction__tracklet.mp4",
+    "tracks_resolved": 6,
+    "known": 3,
+    "unknown": 3,
+    "known_names": {
+      "Emp 07": 1,
+      "Emp 02": 2
+    },
+    "alerts": {
+      "Intrusion Alert: Unregistered Person in Restricted Area": 8,
+      "Security Alert: Unknown Person at Laptop > 5s": 1
+    },
+    "asset_events": []
+  }
+]
