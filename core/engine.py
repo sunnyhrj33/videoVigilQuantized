@@ -27,9 +27,9 @@ import yaml
 from core.chirla import camera_key, day_gallery_path, parse_video_name, source_date
 from core.detector import YoloDetector, get_available_trackers
 from core.geometry import centre, l2n
-from core.open_set import (STATUS_KNOWN, STATUS_PENDING, STATUS_UNKNOWN, Identity,
+from core.open_set import (NO_STAFF, STATUS_KNOWN, STATUS_PENDING, STATUS_UNKNOWN, Identity,
                            OpenSetClassifier, PrototypeGallery, TrackletManager,
-                           display_name, tracklet_features)
+                           display_name, load_day_gallery, tracklet_features)
 from core.overlay import (COL_ALERT, COL_KNOWN, COL_PENDING, COL_UNKNOWN,
                           draw_assets, draw_banners, draw_fps, draw_label,
                           draw_trail, draw_zones, track_colour)
@@ -49,8 +49,14 @@ class DetectionEngine:
     spatial security zones, asset monitoring, suspect auto-enrollment, and audit logging.
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, shared: Optional["DetectionEngine"] = None):
+        """
+        shared: another engine whose Re-ID models, suspect gallery and audit / theft logs this
+        one reuses – one engine per camera when several cameras play together. Each engine
+        keeps its own detector (the tracker state lives in it) and per-camera state.
+        """
         self.cfg = cfg
+        self._shared = shared
         self._reid_cfg = cfg.get("reid", {}).copy()
         det = cfg.get("detection", {})
         vis = cfg.get("visualisation", {})
@@ -87,6 +93,7 @@ class DetectionEngine:
         self._identity_mode = reid_cfg.get("mode", "tracklet")
         self._tracklets: Optional[TrackletManager] = None
         self.gallery_info = "—"
+        self.gallery_report: dict = {}
         self.extra_gallery: Optional[PrototypeGallery] = None
         self._zones = ZoneMonitor(cfg)
         self._zones.configure(None)
@@ -104,8 +111,8 @@ class DetectionEngine:
 
         # Suspect tracking
         self._st = cfg.get("suspect_tracking", {}) or {}
-        self.suspects = SuspectGallery(self._st.get("gallery_dir", "output/suspects"),
-                                       self._st.get("match_threshold", 0.75))
+        self.suspects = shared.suspects if shared is not None else SuspectGallery(
+            self._st.get("gallery_dir", "output/suspects"), self._st.get("match_threshold", 0.75))
         self._history = TrackHistory(self._st.get("history_log", "output/track_history.csv"),
                                      self._st.get("history_interval_frames", 30))
         self._theft: Optional[AuditLogger] = None
@@ -125,7 +132,8 @@ class DetectionEngine:
         # Re-ID
         self._reid_enabled = reid_cfg.get("enabled", True)
         self._reid_model_name: Optional[str] = None
-        self._reid_extractor_cache: Dict[str, ReIDExtractor] = {}
+        self._reid_extractor_cache: Dict[str, ReIDExtractor] = (
+            shared._reid_extractor_cache if shared is not None else {})
         self._reid_extractor: Optional[ReIDExtractor] = None
         self._gallery: Optional[ReIDGallery] = None
         if self._reid_enabled:
@@ -241,8 +249,13 @@ class DetectionEngine:
         with self._engine_lock:
             self._frame_idx += 1
 
-    def set_source(self, source, fps: float = 30.0, start_frame: int = 0):
-        """Bind a new video source: camera ID, clock, per-camera zones / anchors; reset state."""
+    def set_source(self, source, fps: float = 30.0, start_frame: int = 0,
+                   gallery_date: Optional[str] = None):
+        """
+        Bind a new video source: camera ID, clock, per-camera zones / anchors; reset state.
+        gallery_date picks the enrolled staff gallery (see _gallery_for); None keeps the
+        console behaviour of reading the date from a CHIRLA filename.
+        """
         with self._engine_lock:
             cam, start = parse_video_name(str(source)) if isinstance(source, str) else (None, None)
             fps = fps if fps and fps > 1 else 30.0
@@ -263,7 +276,10 @@ class DetectionEngine:
             self._suspect_cleared.clear()
             self._pending_disp.clear()
             if self._tracklets is not None:
-                self._tracklets.set_gallery(self._gallery_for(source))
+                self._tracklets.set_gallery(self._gallery_for(source, gallery_date))
+            else:
+                self.gallery_report = {"date": None, "how": "legacy", "staff": 0, "named": 0,
+                                       "warning": "Enrolled identification is off (legacy runtime Re-ID)"}
             self._logged_identity.clear()
             self._zone_alert_t.clear()
             self._banners.clear()
@@ -274,26 +290,70 @@ class DetectionEngine:
             logger.info("Source bound: camera=%s zones=%s gallery=%s", self._camera_id,
                         list(self._zones.zones), self.gallery_info)
 
-    def _gallery_for(self, source) -> PrototypeGallery:
-        """Same-day enrollment: a CHIRLA video uses the gallery enrolled on its recording date."""
+    def _gallery_for(self, source, gallery_date: Optional[str] = None) -> PrototypeGallery:
+        """
+        Same-day enrollment: pick the staff gallery for this source.
+          gallery_date=None          – the CHIRLA video's recording date, else the default gallery
+          gallery_date="YYYY-MM-DD"  – the gallery enrolled that day; if that day can't be used,
+                                       no staff gallery (another day's clothes would mislabel people)
+          gallery_date="none"        – no staff gallery
+        People named in the dashboard (extra_gallery) are merged in either way.
+        Sets self.gallery_report = {date, how, staff, named, warning}.
+        """
         default = Path(self._reid_cfg.get("gallery_file", "enrolled_gallery/gallery_prototypes.pkl"))
-        date = source_date(str(source)) if isinstance(source, str) else None
-        path = day_gallery_path(default, date)
-        if date and not path.exists():
-            logger.warning("No gallery enrolled for %s – using default %s", date, default)
-            path = default
-        gallery = PrototypeGallery.load(path)
+        warning = None
+        if gallery_date is None:
+            date = source_date(str(source)) if isinstance(source, str) else None
+            path, how = day_gallery_path(default, date), "filename"
+            if not date or not path.exists():
+                if date:
+                    logger.warning("No gallery enrolled for %s – using default %s", date, default)
+                path, how = default, "default"
+            staff = PrototypeGallery.load(path)
+        elif gallery_date == NO_STAFF:
+            staff, how = None, "none"
+        else:
+            staff, warning = load_day_gallery(default, gallery_date, self._reid_model_name)
+            how = "selected"
+            if warning:
+                logger.warning("%s – analysing without enrolled staff", warning)
+        date = staff.meta.get("date") if staff is not None else (
+            gallery_date if gallery_date != NO_STAFF else None)
+        gallery = staff if staff is not None else PrototypeGallery.empty({"date": date or "no staff"})
+        n_staff = len(gallery)
         if self.extra_gallery is not None:
             gallery = gallery.merged(self.extra_gallery)
-        self.gallery_info = f"{gallery.meta.get('date', 'default')} · {len(gallery)} enrolled"
+        self.gallery_report = {"date": date, "how": how, "staff": n_staff,
+                               "named": len(gallery) - n_staff, "warning": warning}
+        self.gallery_info = (f"{date or 'default'} · {n_staff} enrolled" if staff is not None
+                             else f"{date or '—'} · no staff gallery")
         return gallery
 
     def close(self):
-        for log in (self._audit, self._theft):
-            if log is not None:
-                log.close()
+        if self._shared is None:            # shared logs belong to (and are closed by) the owner
+            for log in (self._audit, self._theft):
+                if log is not None:
+                    log.close()
         self._audit = self._theft = None
         self._history.close()
+
+    def adopt_settings(self, src: "DetectionEngine"):
+        """Copy every operator-tunable setting (thresholds, overlays, models, mode) from src."""
+        with self._engine_lock:
+            for k in ("conf", "iou", "classes", "imgsz", "max_det", "person_conf", "zones_enabled",
+                      "show_labels", "show_conf", "show_tid", "show_rid", "show_trail", "box_thick",
+                      "font_scale", "show_fps", "_reid_enabled", "extra_gallery"):
+                setattr(self, k, getattr(src, k))
+            self._assets.enabled = src._assets.enabled
+            if src._reid_model_name and src._reid_model_name != self._reid_model_name:
+                self.set_reid_model(src._reid_model_name)
+            if src._model_key and src._model_key != self._model_key:
+                self.load_model(src._model_key)
+            if src._tracker_name != self._tracker_name:
+                self.set_tracker(src._tracker_name)
+            if src._identity_mode != self._identity_mode:
+                self.set_identity_mode(src._identity_mode)
+            self.set_open_set_threshold(src._reid_cfg.get("open_set_p_threshold", 0.5))
 
     # ── Per-frame inference ───────────────────────────────────────────────────
 
@@ -618,7 +678,7 @@ class DetectionEngine:
         recent = embs[-3:]
         sim = float(l2n(l2n(recent).mean(axis=0)) @ self.suspects.prototypes[sid]) if len(recent) else 1.0
         employee = ident.status == STATUS_KNOWN and ident.confidence >= self._tracklets.p_thresh + 0.2
-        if not employee and len(recent) >= 3:
+        if not employee and len(recent) >= 3 and len(self._tracklets.gallery):
             feats, win = tracklet_features(recent, self._tracklets.gallery)
             if self._tracklets.classifier.p_known(feats) >= self._tracklets.p_thresh + 0.2:
                 employee = True
@@ -663,7 +723,10 @@ class DetectionEngine:
 
     def _theft_log(self, tid, ident: Identity, status: str, detail: str):
         if self._theft is None:
-            self._theft = AuditLogger(self._theft_path)
+            owner = self._shared or self
+            if owner._theft is None:
+                owner._theft = AuditLogger(owner._theft_path)
+            self._theft = owner._theft
         who = self._suspect_of.get(tid) if tid is not None else None
         self._theft.log(self._clock.stamp(), self._camera_id, tid if tid is not None else -1,
                         who or self._log_name(ident), status, ident.confidence, "None", detail)
@@ -704,7 +767,10 @@ class DetectionEngine:
 
     def _audit_log(self, tid: int, ident: Identity, zone: str = "None", asset: str = "None"):
         if self._audit is None:
-            self._audit = AuditLogger(self._audit_path)
+            owner = self._shared or self
+            if owner._audit is None:
+                owner._audit = AuditLogger(owner._audit_path)
+            self._audit = owner._audit
         self._audit.log(self._clock.stamp(), self._camera_id, tid, self._log_name(ident),
                         ident.status, ident.confidence, zone, asset)
 

@@ -18,7 +18,8 @@ import queue
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from datetime import date as _date
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Optional
 
 from console.tabs import (AuditTab, EvalTab, GalleryTab, LiveTab, PipelineTab,
@@ -28,14 +29,24 @@ from console.theme import (ACCENT, ACCENT2, BG, BORDER, CARD, CARD2, CYAN,
                            PURPLE, WARN, Chip, ScrollFrame, append_text,
                            button, clear_text, combo, labelled, section,
                            slider)
-from console.worker import QueueLogHandler, VideoWorker
+from console.worker import MultiCameraWorker, QueueLogHandler, VideoWorker, analysis_rate
+from core.chirla import date_in_name, is_iso_date
 from core.detector import get_available_trackers, get_system_spec
 from core.engine import DetectionEngine
+from core.open_set import list_day_galleries
+from core.recordings import recordings_cfg, scan_days
 from core.reid import REID_MODELS
 
 CONFIG_PATH = "config.yaml"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DEMO_MANIFEST = Path("output/demo/demo_clips.json")
+DEMO_PLACEHOLDER = "— choose a demo clip —"
+DATE_PLACEHOLDER = "— choose recording date —"
+DATE_OTHER = "Other date…"
+SOURCE_MODES = [("demo", "Demo clip"), ("video", "Video / webcam"), ("day", "Recorded day")]
+# Analysis rate (frames analysed per video second, per camera): label → config value
+RATES = [("Auto", "auto"), ("All frames  (most accurate)", "all"), ("15 fps", "15"), ("10 fps", "10"),
+         ("5 fps", "5"), ("3 fps  (smoothest)", "3")]
 
 MODES = [
     ("tracklet", "Tracklet  (open-set)"),
@@ -67,11 +78,17 @@ class App(tk.Tk):
         self.engine = DetectionEngine(self.cfg)
         self._tracker_names = get_available_trackers()
 
-        self._worker: Optional[VideoWorker] = None
+        self._worker = None                     # VideoWorker | MultiCameraWorker
         self._frame_q: queue.Queue = queue.Queue(maxsize=5)
         self._running = False
         self._after_id = None
-        self._last_event = 0
+        self._last_event: dict = {}             # id(engine) → last event number shown
+        # Extra engines for cameras 2…N of a recorded day (camera 1 uses self.engine); they
+        # share its Re-ID model, suspect gallery and logs, and are kept for the next run.
+        self._engine_pool: list = []
+        self._last_multi: Optional[dict] = None
+        self._stopping = None                   # multi-camera worker still winding down
+        self.checkin_busy = False               # Gallery → check-in analysis is using self.engine
 
         self._setup_style()
         self._build_ui()
@@ -205,31 +222,92 @@ class App(tk.Tk):
         sf.grid_propagate(False)
         sb = sf.inner
 
-        # Video Source
+        # Video Source: demo clip · own video / webcam · recorded day (all cameras together)
         section(sb, "VIDEO SOURCE")
+        self._src_mode = tk.StringVar(value="video")
+        mode_row = tk.Frame(sb, bg=PANEL)
+        mode_row.pack(fill="x", padx=16)
+        self._src_mode_buttons = {}
+        for i, (key, text) in enumerate(SOURCE_MODES):
+            b = tk.Button(mode_row, text=text, bd=0, relief="flat", font=(FONT, 8, "bold"), pady=5,
+                          cursor="hand2", command=lambda k=key: self._set_source_mode(k))
+            b.grid(row=0, column=i, sticky="ew", padx=1)
+            mode_row.columnconfigure(i, weight=1, uniform="src")
+            self._src_mode_buttons[key] = b
+        src_box = tk.Frame(sb, bg=PANEL)
+        src_box.pack(fill="x", pady=(6, 0))
+        self._src_panels = {k: tk.Frame(src_box, bg=PANEL) for k, _ in SOURCE_MODES}
+
+        # ··· Demo clip
+        p = self._src_panels["demo"]
+        self._demo_var = tk.StringVar()
+        self._demo_combo = combo(p, self._demo_var, [])
+        self._demo_combo.pack(fill="x", padx=16)
+        self._demo_combo.bind("<<ComboboxSelected>>", lambda e: self._select_demo())
+        self._demo_note = tk.Label(p, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
+                                   anchor="w", wraplength=250)
+        self._demo_note.pack(fill="x", padx=16, pady=(4, 0))
+        button(p, "▶  Play smooth render", self._play_render, CARD2, fg=FG).pack(
+            fill="x", padx=16, pady=(6, 0))
+
+        # ··· Own video or webcam (+ its recording date → that day's staff gallery; required for
+        #     video files – a date in the file name is only offered as a hint)
+        p = self._src_panels["video"]
         self._source_var = tk.StringVar(value="Webcam (device 0)")
-        tk.Entry(sb, textvariable=self._source_var, bg=CARD, fg=FG, insertbackground=ACCENT,
+        tk.Entry(p, textvariable=self._source_var, bg=CARD, fg=FG, insertbackground=ACCENT,
                  font=(FONT, 9), bd=0, relief="flat", highlightthickness=1,
                  highlightbackground=BORDER, highlightcolor=ACCENT).pack(fill="x", padx=16, ipady=5)
-        row = tk.Frame(sb, bg=PANEL)
+        row = tk.Frame(p, bg=PANEL)
         row.pack(fill="x", padx=16, pady=(6, 0))
         button(row, "📷  Webcam", lambda: self._source_var.set("Webcam (device 0)"),
                CARD2, fg=FG).pack(side="left", fill="x", expand=True, padx=(0, 3))
         button(row, "📂  Browse…", self._browse_file, CARD2, fg=FG).pack(
             side="left", fill="x", expand=True, padx=(3, 0))
-
-        # Demo Clips
-        section(sb, "DEMO CLIPS")
-        self._demo_var = tk.StringVar()
-        self._demo_combo = combo(sb, self._demo_var, [])
-        self._demo_combo.pack(fill="x", padx=16)
-        self._demo_combo.bind("<<ComboboxSelected>>", lambda e: self._select_demo())
-        self._demo_note = tk.Label(sb, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
+        self._video_date: Optional[str] = None
+        self._date_items: dict = {}
+        self._date_var = tk.StringVar(value=DATE_PLACEHOLDER)
+        self._date_combo = combo(p, self._date_var, [])
+        labelled(p, "Recorded", self._date_combo)
+        self._date_combo.bind("<<ComboboxSelected>>", lambda e: self._on_date_pick())
+        self._date_hint = tk.Frame(p, bg=PANEL)
+        self._date_hint.pack(fill="x", padx=16)
+        self._date_hint_btn = button(self._date_hint, "", self._use_name_date, CARD2, fg=FG)
+        self._date_note = tk.Label(p, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
                                    anchor="w", wraplength=250)
-        self._demo_note.pack(fill="x", padx=16, pady=(4, 0))
-        button(sb, "▶  Play smooth render", self._play_render, CARD2, fg=FG).pack(
-            fill="x", padx=16, pady=(6, 0))
+        self._date_note.pack(fill="x", padx=16, pady=(2, 0))
+
+        # ··· Recorded day: every camera of one sequence
+        p = self._src_panels["day"]
+        self._days: dict = {}
+        self._day_items: dict = {}
+        self._seq_items: dict = {}
+        self._day_var, self._seq_var = tk.StringVar(), tk.StringVar()
+        self._day_combo = combo(p, self._day_var, [])
+        labelled(p, "Day", self._day_combo)
+        self._day_combo.bind("<<ComboboxSelected>>", lambda e: self._select_day())
+        self._seq_combo = combo(p, self._seq_var, [])
+        labelled(p, "Sequence", self._seq_combo)
+        self._seq_combo.bind("<<ComboboxSelected>>", lambda e: self._update_day_note())
+        self._day_note = tk.Label(p, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
+                                  anchor="w", wraplength=250)
+        self._day_note.pack(fill="x", padx=16, pady=(2, 0))
+        button(p, "↻  Rescan recordings", self._reload_days, CARD2, fg=FG).pack(fill="x", padx=16, pady=(6, 0))
+
+        # Analysis rate: accuracy ↔ smoothness (applies to all modes, live)
+        self._rate_var = tk.StringVar(value=self._rate_label(self.cfg.get("video", {}).get("analysis_fps", "auto")))
+        rate = combo(sb, self._rate_var, [label for label, _ in RATES])
+        labelled(sb, "Analysis", rate)
+        rate.bind("<<ComboboxSelected>>", lambda e: self._on_rate_changed())
+        self._rate_note = tk.Label(sb, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
+                                   anchor="w", wraplength=250)
+        self._rate_note.pack(fill="x", padx=16, pady=(2, 0))
+
+        self._reload_gallery_days()
         self._reload_demo_clips()
+        self._reload_days()
+        self._source_var.trace_add("write", lambda *_: self._on_source_changed())
+        self._set_source_mode("video")
+        self._update_rate_note()
 
         # Models (all YOLO variants + OSNet/ResNet Re-ID models + native trackers)
         section(sb, "MODELS")
@@ -263,12 +341,13 @@ class App(tk.Tk):
         self._pknown_var = tk.DoubleVar(value=self.cfg["reid"].get("open_set_p_threshold", 0.5))
         self._iou_var = tk.DoubleVar(value=det.get("iou_threshold", 0.45))
         slider(sb, "Detector confidence (all objects)", self._conf_var, 0.05, 1.0,
-               lambda v: setattr(self.engine, "conf", v))
+               lambda v: self._for_engines(lambda e: setattr(e, "conf", v)))
         slider(sb, "Person confidence (hides chairs etc.)", self._person_conf_var, 0.05, 1.0,
-               lambda v: setattr(self.engine, "person_conf", v))
+               lambda v: self._for_engines(lambda e: setattr(e, "person_conf", v)))
         slider(sb, "Unknown threshold  P(Known) <", self._pknown_var, 0.05, 0.95,
-               self.engine.set_open_set_threshold)
-        slider(sb, "IoU threshold", self._iou_var, 0.1, 1.0, lambda v: setattr(self.engine, "iou", v))
+               lambda v: self._for_engines(lambda e: e.set_open_set_threshold(v)))
+        slider(sb, "IoU threshold", self._iou_var, 0.1, 1.0,
+               lambda v: self._for_engines(lambda e: setattr(e, "iou", v)))
         tk.Label(sb, text="Person confidence = how sure YOLO is the box is a person.\n"
                           "Unknown threshold = below this P(Known) a person is UNKNOWN.",
                  bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left", anchor="w").pack(fill="x", padx=16)
@@ -279,7 +358,8 @@ class App(tk.Tk):
         self._zones_var = tk.BooleanVar(value=self.engine.zones_enabled)
         self._realtime_var = tk.BooleanVar(value=True)
         for i, (text, var, cmd) in enumerate((
-            ("Show trails", self._trail_var, lambda: setattr(self.engine, "show_trail", self._trail_var.get())),
+            ("Show trails", self._trail_var,
+             lambda: self._for_engines(lambda e: setattr(e, "show_trail", self._trail_var.get()))),
             ("Identity / Re-ID", self._reid_var, None),
             ("Restricted zones", self._zones_var, self._toggle_zones),
             ("Real-time playback", self._realtime_var, self._toggle_realtime),
@@ -295,7 +375,7 @@ class App(tk.Tk):
             sb, text="Monitor laptops / bags (displacement → theft alert)", variable=self._assets_var,
             bg=PANEL, fg=FG, selectcolor=CARD, activebackground=PANEL, activeforeground=ACCENT,
             font=(FONT, 9), cursor="hand2",
-            command=lambda: setattr(self.engine._assets, "enabled", self._assets_var.get()),
+            command=lambda: self._for_engines(lambda e: setattr(e._assets, "enabled", self._assets_var.get())),
         ).pack(anchor="w", padx=12)
         arow = tk.Frame(sb, bg=PANEL)
         arow.pack(fill="x", padx=16, pady=(4, 0))
@@ -397,6 +477,11 @@ class App(tk.Tk):
             self._load_model(quiet=True)
 
     def _load_model(self, quiet: bool = False):
+        if self.checkin_busy:
+            if not quiet:
+                messagebox.showinfo("Check-in running", "Wait for the check-in analysis to finish before "
+                                                        "loading other models.")
+            return
         if self._running:
             self._stop()
         key, reid_model = self._model_var.get(), self._reid_model_var.get()
@@ -414,10 +499,11 @@ class App(tk.Tk):
                 messagebox.showerror("Model Error", f"Failed to load model:\n\n{exc}")
             self._set_status(f"Model load failed: {exc}")
         self._refresh_chips()
+        self._reload_gallery_days()      # which days are usable depends on the Re-ID model
 
     def _set_mode(self, mode: str):
         self._mode_var.set(mode)
-        self.engine.set_identity_mode(mode)
+        self._for_engines(lambda e: e.set_identity_mode(mode))
         self._paint_mode_buttons()
         self._refresh_chips()
         self._set_status(f"Identity mode → {mode}")
@@ -428,7 +514,7 @@ class App(tk.Tk):
             b.config(bg=ACCENT if on else CARD, fg=BG if on else FG, activebackground=ACCENT2)
 
     def _toggle_zones(self):
-        self.engine.zones_enabled = self._zones_var.get()
+        self._for_engines(lambda e: setattr(e, "zones_enabled", self._zones_var.get()))
         self._set_status(f"Restricted zones {'ON' if self.engine.zones_enabled else 'OFF'}")
         logger.info("Restricted zones %s", "enabled" if self.engine.zones_enabled else "disabled")
 
@@ -463,14 +549,115 @@ class App(tk.Tk):
                 self._demo_items[label] = (k, m)
         self._demo_combo.config(values=list(self._demo_items) or ["(run Pipeline step 4)"])
         if self._demo_var.get() not in self._demo_items:
-            self._demo_var.set("— choose a demo clip —" if self._demo_items else "(run Pipeline step 4)")
+            self._demo_var.set(DEMO_PLACEHOLDER if self._demo_items else "(run Pipeline step 4)")
+
+    def _demo_path(self, m: dict) -> str:
+        return str(DEMO_MANIFEST.parent / m["file"])
+
+    # ── Recording date (staff gallery of that day) ────────────────────────────
+
+    def _reload_gallery_days(self):
+        """Fill the date picker with every enrolled day; keep the current choice."""
+        model = self.engine._reid_model_name or self.cfg.get("reid", {}).get("model")
+        gallery_file = self.cfg.get("reid", {}).get("gallery_file", "enrolled_gallery/gallery_prototypes.pkl")
+        try:
+            days = list_day_galleries(gallery_file, model)
+        except Exception as exc:
+            logger.warning("Could not list enrolled days (%s)", exc)
+            days = []
+        self._gallery_days = {d["date"]: d for d in days}
+        self._date_items = {}
+        for d in days:
+            label = f"{d['date']}  ·  {d['staff']} staff" if d["usable"] else f"{d['date']}  ·  can't be used"
+            self._date_items[label] = d["date"]
+        if self._video_date and self._video_date not in self._gallery_days:
+            self._date_items[f"{self._video_date}  ·  no staff enrolled"] = self._video_date
+        self._date_combo.config(values=list(self._date_items) + [DATE_OTHER])
+        self._show_video_date()
+
+    def _set_video_date(self, iso: Optional[str]):
+        self._video_date = iso if is_iso_date(iso) else None
+        if self._video_date and self._video_date not in self._date_items.values():
+            self._date_items[f"{self._video_date}  ·  no staff enrolled"] = self._video_date
+            self._date_combo.config(values=list(self._date_items) + [DATE_OTHER])
+        self._show_video_date()
+
+    def _show_video_date(self):
+        label = next((k for k, v in self._date_items.items() if v == self._video_date), None)
+        self._date_var.set(label if self._video_date and label else DATE_PLACEHOLDER)
+        self._update_date_note()
+
+    def _on_date_pick(self):
+        picked = self._date_var.get()
+        if picked != DATE_OTHER:
+            self._set_video_date(self._date_items.get(picked))
+            return
+        hint = date_in_name(self._source_var.get()) or self._video_date or _date.today().isoformat()
+        while True:
+            iso = simpledialog.askstring("Recording date", "Date the video was recorded (YYYY-MM-DD):",
+                                         initialvalue=hint, parent=self)
+            if iso is None:                     # cancelled: keep the previous choice
+                self._show_video_date()
+                return
+            iso = iso.strip()
+            if not is_iso_date(iso):
+                messagebox.showerror("Recording date", f"“{iso}” isn't a valid date – use YYYY-MM-DD.")
+            elif iso > _date.today().isoformat():
+                messagebox.showerror("Recording date", "The recording date can't be in the future.")
+            else:
+                self._set_video_date(iso)
+                return
+            hint = iso
+
+    def _use_name_date(self):
+        self._set_video_date(date_in_name(self._source_var.get()))
+
+    def _update_date_note(self):
+        source = self._resolve_source()
+        iso, is_file = self._video_date, isinstance(source, str)
+        suggested = date_in_name(source) if is_file else None
+        if suggested and suggested != iso:
+            self._date_hint_btn.config(text=f"Use {suggested} (date in the file name)")
+            self._date_hint_btn.pack(fill="x", pady=(4, 0))
+        else:
+            self._date_hint_btn.pack_forget()
+
+        colour = FG_DIM
+        if iso is None:
+            if is_file:
+                text, colour = "Choose the date this video was recorded – the staff enrolled that day are " \
+                               "recognised.", WARN
+            else:
+                text = "Webcam: uses the default staff gallery. Choose a date to use another day's staff."
+        else:
+            day = self._gallery_days.get(iso)
+            if day and day["usable"]:
+                text, colour = f"✓ The {day['staff']} staff enrolled on {iso} will be recognised.", ACCENT
+            else:
+                why = day["problem"] if day and day.get("problem") else f"No staff are enrolled for {iso}"
+                text, colour = f"⚠ {why}. Everyone will be UNKNOWN.", WARN
+            if suggested and suggested != iso:
+                text += f"\nThe file name mentions {suggested} – check the date."
+                colour = WARN
+        self._date_note.config(text=text, fg=colour)
+
+    def _on_source_changed(self):
+        """A new source needs its own recording date; a demo selection no longer applies."""
+        src = self._source_var.get().strip()
+        item = self._demo_items.get(self._demo_var.get())
+        if item and self._demo_path(item[1]) != src:
+            self._demo_var.set(DEMO_PLACEHOLDER)
+            self._demo_note.config(text="")
+        self._video_date = None
+        self._show_video_date()
 
     def _select_demo(self):
         item = self._demo_items.get(self._demo_var.get())
         if not item:
             return
         key, m = item
-        self._source_var.set(str(DEMO_MANIFEST.parent / m["file"]))
+        self._source_var.set(self._demo_path(m))
+        self._set_video_date(m.get("date") or date_in_name(m["file"]))
         tips = {
             "demo1": "Watch the employee keep a stable green identity through the occlusion.",
             "demo2": "Run once in NAIVE mode (visitor gets an employee name), then TRACKLET "
@@ -481,6 +668,158 @@ class App(tk.Tk):
         visitors = ", ".join(str(v) for v in m.get("visitors", [])) or "—"
         self._demo_note.config(text=f"{m.get('source', '')} · {m.get('date', '')}\n"
                                     f"In view: {people} · visitors {visitors}\n{tips.get(key, '')}")
+
+    # ── Source mode ───────────────────────────────────────────────────────────
+
+    def source_mode(self) -> str:
+        return self._src_mode.get()
+
+    def _set_source_mode(self, mode: str):
+        self._src_mode.set(mode)
+        for key, panel in self._src_panels.items():
+            panel.pack_forget()
+            on = key == mode
+            self._src_mode_buttons[key].config(bg=ACCENT if on else CARD, fg=BG if on else FG,
+                                               activebackground=ACCENT2)
+        self._src_panels[mode].pack(fill="x")
+        self._update_rate_note()
+
+    # ── Recorded days (every camera of one sequence) ──────────────────────────
+
+    def _reload_days(self):
+        rc = recordings_cfg(self.cfg)
+        try:
+            self._days = scan_days(rc["root"], int(rc["cameras"]))
+        except Exception as exc:
+            logger.warning("Could not scan recordings in %s (%s)", rc["root"], exc)
+            self._days = {}
+        self._day_items = {f"{d}  ·  {len(s)} sequence{'s' if len(s) > 1 else ''}": d
+                           for d, s in self._days.items()}
+        self._day_combo.config(values=list(self._day_items))
+        if self._day_var.get() not in self._day_items:
+            self._day_var.set("— choose a day —" if self._day_items else "(no recordings found)")
+        self._select_day()
+
+    def _select_day(self):
+        seqs = self._days.get(self._day_items.get(self._day_var.get()), [])
+        self._seq_items = {}
+        for s in seqs:
+            start = s.start.strftime("%H:%M:%S") if s.start else "time ?"
+            self._seq_items[f"{s.name}  ·  {start}  ·  {len(s.cameras)} cam"] = s
+        values = list(self._seq_items)
+        self._seq_combo.config(values=values)
+        if self._seq_var.get() not in self._seq_items:
+            self._seq_var.set(values[0] if values else "")
+        self._update_day_note()
+
+    def selected_sequence(self):
+        return self._seq_items.get(self._seq_var.get())
+
+    def _update_day_note(self):
+        root = recordings_cfg(self.cfg)["root"]
+        seq = self.selected_sequence()
+        colour = FG_DIM
+        if not self._days:
+            text, colour = (f"No recorded days found in “{root}”. Expected "
+                            f"{root}/YYYY-MM-DD/<sequence>/camera_N_….avi"), WARN
+        elif seq is None:
+            text = "Choose a day; then pick one of its sequences."
+        else:
+            cams = ", ".join(c.cam_id.replace("Cam_", "") for c in seq.cameras)
+            lines = [f"{len(seq.cameras)} cameras play together: {cams}"]
+            day = self._gallery_days.get(seq.date)
+            if day and day["usable"]:
+                lines.append(f"✓ {day['staff']} staff enrolled on {seq.date} will be recognised.")
+            else:
+                why = day["problem"] if day and day.get("problem") else f"No staff are enrolled for {seq.date}"
+                lines.append(f"⚠ {why} – everyone will be UNKNOWN.")
+                colour = WARN
+            if seq.missing:
+                lines.append(f"⚠ Missing: {', '.join(seq.missing)} – playing the {len(seq.cameras)} available.")
+                colour = WARN
+            if seq.duplicates:
+                lines.append(f"Extra videos ignored: {', '.join(p.name for p in seq.duplicates)}")
+            text = "\n".join(lines)
+        self._day_note.config(text=text, fg=colour)
+        self._update_rate_note()
+
+    # ── Analysis rate (accuracy ↔ smoothness) ─────────────────────────────────
+
+    @staticmethod
+    def _rate_label(value) -> str:
+        text = str(value).strip().lower()
+        for label, v in RATES:
+            if v == text or (v.isdigit() and text.replace(".0", "") == v):
+                return label
+        return RATES[0][0]
+
+    def _rate_cameras(self) -> int:
+        w = self._worker
+        if isinstance(w, MultiCameraWorker):
+            return len(w.requested)
+        seq = self.selected_sequence() if self.source_mode() == "day" else None
+        return len(seq.cameras) if seq else 1
+
+    def _current_rate(self, n_cameras: int) -> Optional[float]:
+        return analysis_rate(dict(RATES).get(self._rate_var.get(), "auto"), n_cameras, self.cfg.get("video", {}))
+
+    def _on_rate_changed(self):
+        w = self._worker
+        if w is not None:
+            w.analysis_fps = self._current_rate(self._rate_cameras())
+        self._update_rate_note()
+
+    def _update_rate_note(self):
+        if not hasattr(self, "_rate_note"):
+            return
+        n = self._rate_cameras()
+        rate = self._current_rate(n)
+        per = " per camera" if n > 1 else ""
+        if rate is None:
+            text = (f"Every frame is analysed{per} – most accurate tracking and identities; "
+                    f"playback lags behind real time when the CPU can't keep up.")
+        else:
+            text = (f"Up to {rate:g} frames per second{per} are analysed (the FPS tile shows what this "
+                    f"computer reaches). Lower = smoother playback, but fewer looks at each person: "
+                    f"identities take longer and are less certain.")
+        self._rate_note.config(text=text)
+
+    # ── Engines (one per camera for a recorded day) ───────────────────────────
+
+    def _engines(self) -> list:
+        w = self._worker
+        if isinstance(w, MultiCameraWorker) and w.engines:
+            return list(w.engines)
+        return [self.engine]
+
+    def _for_engines(self, fn):
+        for e in self._engines():
+            fn(e)
+
+    def engine_at(self, index: int) -> DetectionEngine:
+        engines = self._engines()
+        return engines[index] if 0 <= index < len(engines) else self.engine
+
+    def active_engine(self) -> DetectionEngine:
+        """The enlarged camera's engine in the grid, else the main engine."""
+        tab = self.live_tab
+        if tab.multi is not None and tab.focus is not None:
+            return self.engine_at(tab.focus)
+        return self.engine
+
+    def _engine_for_camera(self, i: int) -> DetectionEngine:
+        """Engine for the i-th camera (runs on the playback thread; may load a detector)."""
+        if i == 0:
+            return self.engine
+        while len(self._engine_pool) < i:
+            self._engine_pool.append(DetectionEngine(self.cfg, shared=self.engine))
+        engine = self._engine_pool[i - 1]
+        engine.adopt_settings(self.engine)
+        return engine
+
+    def on_focus_changed(self):
+        if self._last_multi is not None:
+            self._show_multi_stats(self._last_multi)
 
     def _play_render(self):
         item = self._demo_items.get(self._demo_var.get())
@@ -510,7 +849,11 @@ class App(tk.Tk):
     def play_from(self, path: str, frame: int = 0):
         if self._running:
             self._stop()
+        self._set_source_mode("video")
         self._source_var.set(path)
+        # Search / suspect results point at CHIRLA videos and demo clips, whose names carry the
+        # recording date. Anything else asks the user (see _start).
+        self._set_video_date(date_in_name(Path(path).name))
         self._start(start_frame=frame)
 
     def find_video(self, name: str) -> Optional[Path]:
@@ -527,14 +870,22 @@ class App(tk.Tk):
         return None
 
     def _clear_anchors(self):
-        self.engine.clear_asset_anchors()
-        self._set_status(f"Drawn anchors cleared for {self.engine._cam_key or 'this camera'}")
+        if self.live_tab.multi is not None and self.live_tab.focus is None:
+            messagebox.showinfo("Clear anchors", "Click a camera to enlarge it first, then clear its anchors.")
+            return
+        engine = self.active_engine()
+        engine.clear_asset_anchors()
+        self._set_status(f"Drawn anchors cleared for {engine._cam_key or 'this camera'}")
 
     def _start(self, start_frame: int = 0):
         if self.engine._model is None:
             messagebox.showwarning("No model", "Load the models first.")
             return
         if self._running:
+            return
+        if self.checkin_busy:
+            messagebox.showinfo("Check-in running", "A morning check-in is being analysed (Gallery tab). "
+                                                    "Wait for it to finish or cancel it, then press START.")
             return
         self.engine._reid_enabled = self._reid_var.get()
         self.engine.show_trail = self._trail_var.get()
@@ -543,18 +894,61 @@ class App(tk.Tk):
         self.engine.set_tracker(self._tracker_var.get())
         self.engine.set_identity_mode(self._mode_var.get())
 
+        mode = self.source_mode()
+        if mode == "day":
+            self._start_day()
+            return
+        if mode == "demo" and not self._demo_items.get(self._demo_var.get()):
+            messagebox.showinfo("Demo clip", "Choose a demo clip first – or switch to “Video / webcam” "
+                                             "to play your own video.")
+            return
         source = self._resolve_source()
+        if isinstance(source, str) and self._video_date is None:
+            messagebox.showinfo(
+                "Recording date",
+                "Choose the date this video was recorded (VIDEO SOURCE → Recorded).\n\n"
+                "The staff enrolled on that day are used to recognise employees. If nobody was "
+                "enrolled that day, choose “Other date…” and everyone will be shown as UNKNOWN.")
+            self._date_combo.focus_set()
+            return
         self._frame_q = queue.Queue(maxsize=5)
         self._worker = VideoWorker(source, self.engine, self._frame_q,
                                    self.cfg.get("video", {}).get("target_fps", 30),
-                                   realtime=self._realtime_var.get(), start_frame=start_frame)
+                                   realtime=self._realtime_var.get(), start_frame=start_frame,
+                                   gallery_date=self._video_date, analysis_fps=self._current_rate(1))
+        self._begin_run(f"Running · {source}")
+
+    def _start_day(self):
+        """All cameras of the chosen recorded sequence, together (missing cameras: warning)."""
+        seq = self.selected_sequence()
+        if seq is None:
+            messagebox.showinfo("Recorded day", "Choose a recorded day and one of its sequences first.")
+            return
+        if self._stopping is not None and self._stopping.is_alive():
+            messagebox.showinfo("Recorded day", "The previous playback is still shutting down – "
+                                                "try again in a moment.")
+            return
+        self._frame_q = queue.Queue(maxsize=5)
+        self._worker = MultiCameraWorker(seq.cameras, self._engine_for_camera, self._frame_q, seq.date,
+                                         self._current_rate(len(seq.cameras)), realtime=self._realtime_var.get())
+        self.live_tab.start_multi([c.cam_id for c in seq.cameras])
+        self._begin_run(f"Starting {seq.date} {seq.name} · {len(seq.cameras)} cameras …")
+        if seq.missing:
+            text = (f"{', '.join(seq.missing)} missing from {seq.date}/{seq.name} – playing the "
+                    f"{len(seq.cameras)} available cameras")
+            logger.warning(text)
+            self.live_tab.append_event("alert", time.strftime("%H:%M:%S"), "—", text)
+
+    def _begin_run(self, status: str):
         self._worker.start()
+        self._gallery_shown = False
+        self._last_multi = None
         self._running = True
         self.live_tab.clear_feed()
         self._start_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
         self.select_tab("live")
-        self._set_status(f"Running · {source}")
+        self._set_status(status)
         self._poll_frames()
 
     def _stop(self):
@@ -563,6 +957,9 @@ class App(tk.Tk):
         if worker:
             worker.stop()
             worker.join(timeout=2.0)
+            self._drain_events_of(getattr(worker, "engines", None) or [self.engine])
+            # a multi-camera worker may still be loading a detector; don't reuse its engines yet
+            self._stopping = worker if worker.is_alive() else None
         self._worker = None
         if self._after_id:
             self.after_cancel(self._after_id)
@@ -570,6 +967,7 @@ class App(tk.Tk):
         self._start_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
         self._set_status("Stopped.")
+        self.live_tab.end_multi()
         self.live_tab.draw_placeholder()
 
     def _poll_frames(self):
@@ -582,10 +980,33 @@ class App(tk.Tk):
                     frame, stats = payload
                     self.live_tab.display_frame(frame)
                     self.live_tab.update_stats(stats)
+                    if not self._gallery_shown:      # the worker has bound the source's gallery
+                        self._gallery_shown = True
+                        self._refresh_chips()
+                        rep = self.engine.gallery_report
+                        if rep.get("warning") and rep.get("how") != "legacy":
+                            self._set_status(f"Running · ⚠ {rep['warning']} – everyone is shown as UNKNOWN")
+                elif kind == "multi":
+                    self._last_multi = payload
+                    self.live_tab.show_multi(payload)
+                    self._show_multi_stats(payload)
+                    if not self._gallery_shown:
+                        self._gallery_shown = True
+                        self._refresh_chips()
+                        n = len(payload["frames"])
+                        rep = self.engine.gallery_report
+                        warn = f" · ⚠ {rep['warning']} – everyone is UNKNOWN" if rep.get("warning") else ""
+                        self._set_status(f"Running · {n} camera{'s' if n > 1 else ''} · click a camera to "
+                                         f"enlarge it{warn}")
+                elif kind == "status":
+                    self._set_status(payload)
+                elif kind == "warning":
+                    logger.warning(payload)
+                    self.live_tab.append_event("alert", time.strftime("%H:%M:%S"), "—", payload)
                 elif kind == "done":
                     self._drain_events()
                     self._stop()
-                    self._set_status("Video ended.")
+                    self._set_status("Video ended." if self._last_multi is None else "All cameras ended.")
                     return
                 elif kind == "error":
                     messagebox.showerror("Error", payload)
@@ -596,17 +1017,54 @@ class App(tk.Tk):
         self._drain_events()
         self._after_id = self.after(15, self._poll_frames)
 
+    def _show_multi_stats(self, payload: dict):
+        """Totals over every camera for the stat tiles + all cameras' people in one table."""
+        stats = payload["stats"]
+        labels = payload.get("labels") or []
+        people = [{**p, "cam": i, "cam_id": s.get("camera") or (labels[i] if i < len(labels) else "")}
+                  for i, s in enumerate(stats) for p in s.get("people", [])]
+        live = [s for s in stats if s]
+        agg = {k: sum(s.get(k, 0) or 0 for s in live) for k in ("known", "unknown", "alerts", "tracks")}
+        agg["fps"] = sum(s.get("fps", 0) for s in live) / len(live) if live else 0.0
+        agg["people"] = people
+        focus = self.live_tab.focus
+        if focus is not None and focus < len(stats) and stats[focus]:
+            s = stats[focus]
+            agg.update(camera=f"{s.get('camera', '')} (enlarged)", time=s.get("time", ""), assets=s.get("assets", []))
+        elif live:
+            ended = sum(payload["ended"])
+            agg.update(camera=f"{len(stats)} cameras" + (f", {ended} ended" if ended else ""),
+                       time=live[0].get("time", ""),
+                       assets=[(f"{s.get('camera', '')} {n}", st) for s in live for n, st in s.get("assets", [])])
+        self.live_tab.update_stats(agg)
+
     def _drain_events(self):
-        for no, level, stamp, cam, text in self.engine.events_since(self._last_event):
-            self._last_event = no
-            self.live_tab.append_event(level, stamp, cam, text)
+        self._drain_events_of(self._engines())
+
+    def _drain_events_of(self, engines):
+        for engine in engines:
+            last = self._last_event.get(id(engine), 0)
+            for no, level, stamp, cam, text in engine.events_since(last):
+                last = no
+                self.live_tab.append_event(level, stamp, cam, text)
+            self._last_event[id(engine)] = last
+
+    def on_gallery_changed(self, day: str):
+        """A day's staff gallery was (re)built from a check-in: refresh every place that lists galleries."""
+        self._reload_gallery_days()
+        self._update_day_note()
+        self.gallery_tab.load_days(select=day)
+        self._refresh_chips()
+        self._set_status(f"✓ Staff gallery for {day} updated – used by videos recorded that day from now on")
 
     def on_pipeline_step_finished(self, key: str):
         if key in ("export", "gallery", "train"):
             self.engine._reid_extractor_cache.clear()
             self.engine._reid_model_name = None
             self.engine.set_reid_model(self._reid_model_var.get())
+            self._drop_engine_pool()        # rebuilt with the new models / gallery / classifier
             self._refresh_chips()
+            self._reload_gallery_days()
         if key == "clips":
             self._reload_demo_clips()
         if key == "index":
@@ -631,8 +1089,17 @@ class App(tk.Tk):
             append_text(self._log, chunks, autoscroll=self._autoscroll.get())
         self.after(100, self._poll_logs)
 
+    def _drop_engine_pool(self):
+        if isinstance(self._worker, MultiCameraWorker):
+            self._stop()
+        for engine in self._engine_pool:
+            engine.close()
+        self._engine_pool.clear()
+
     def _on_close(self):
         self._stop()
+        for engine in self._engine_pool:
+            engine.close()
         self.pipeline_tab.terminate()
         self.search_tab._runner.terminate()
         self.engine.close()
@@ -643,6 +1110,10 @@ def _parse_args():
     ap = argparse.ArgumentParser(description="VIDEO VIGIL security console")
     ap.add_argument("--demo", choices=["demo1", "demo2", "demo3"], help="preselect a demo clip")
     ap.add_argument("--source", help="video file / camera index to preselect")
+    ap.add_argument("--date", help="recording date of --source (YYYY-MM-DD) → that day's staff gallery")
+    ap.add_argument("--day", help="recorded day to preselect (YYYY-MM-DD): all its cameras play together")
+    ap.add_argument("--seq", help="sequence of --day, e.g. seq_000 (default: the day's first)")
+    ap.add_argument("--rate", help="analysis rate per camera: auto | all | 15 | 10 | 5 | 3")
     ap.add_argument("--mode", choices=[m for m, _ in MODES], help="identity mode")
     ap.add_argument("--start", action="store_true", help="start playback once models are loaded")
     ap.add_argument("--search", metavar="SUSPECT_ID", help="open Video Search for a suspect, e.g. SUSPECT_01")
@@ -654,13 +1125,37 @@ def _parse_args():
 def _apply_args(app: App, args):
     if args.mode:
         app._set_mode(args.mode)
+    if args.rate:
+        app._rate_var.set(app._rate_label(args.rate))
+        app._on_rate_changed()
     if args.demo:
+        app._set_source_mode("demo")
         for label, (key, _) in app._demo_items.items():
             if key == args.demo:
                 app._demo_var.set(label)
                 app._select_demo()
     if args.source:
+        app._set_source_mode("video")
         app._source_var.set(args.source)
+    if args.day:
+        app._set_source_mode("day")
+        label = next((k for k, d in app._day_items.items() if d == args.day), None)
+        if label is None:
+            logger.warning("--day %s: no recordings for that day", args.day)
+        else:
+            app._day_var.set(label)
+            app._select_day()
+            seq = next((k for k, s in app._seq_items.items() if s.name == args.seq), None) if args.seq else None
+            if seq:
+                app._seq_var.set(seq)
+                app._update_day_note()
+            elif args.seq:
+                logger.warning("--seq %s not found on %s – using %s", args.seq, args.day, app._seq_var.get())
+    if args.date:
+        if is_iso_date(args.date):
+            app._set_video_date(args.date)
+        else:
+            logger.warning("--date %s ignored: use YYYY-MM-DD", args.date)
     if args.tab:
         app.select_tab(App.TAB_ORDER[args.tab] if args.tab < len(App.TAB_ORDER) else "live")
     if args.start:

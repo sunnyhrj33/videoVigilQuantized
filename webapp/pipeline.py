@@ -33,9 +33,12 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
+from core.chirla import date_in_name, is_iso_date
+from core.enrollment import (EnrollmentError, all_staff_labels, build_staff, describe_existing,
+                             eligibility, write_day_gallery)
 from core.geometry import l2n, sharpness
-from core.open_set import (STATUS_KNOWN, STATUS_PENDING, STATUS_UNKNOWN,
-                           PrototypeGallery, display_name)
+from core.open_set import (NO_STAFF, STATUS_KNOWN, STATUS_PENDING, STATUS_UNKNOWN,
+                           PrototypeGallery, display_name, list_day_galleries)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,7 @@ DEFAULTS = {
     "host": "127.0.0.1", "port": 8000, "data_dir": "output/web", "detector": "yolo11n_int8_480",
     "analysis_fps": 15, "output_width": 1280, "max_upload_mb": 2048, "min_person_seconds": 1.0,
     "same_person_threshold": 0.75, "thumbs_per_person": 6,
+    "staff_enrollment": True, "enroll_samples": 5, "enroll_min_samples": 3,
 }
 
 
@@ -59,6 +63,18 @@ class AnalysisError(Exception):
 
 def web_settings(cfg: dict) -> dict:
     return {**DEFAULTS, **(cfg.get("web") or {})}
+
+
+def check_video_date(value) -> str:
+    """The recording date chosen at upload: required, a real calendar date, not in the future."""
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError("Choose the date the video was recorded.")
+    if not is_iso_date(value):
+        raise ValueError(f"“{value[:20]}” isn't a valid date – use YYYY-MM-DD.")
+    if value > datetime.now().strftime("%Y-%m-%d"):
+        raise ValueError("The recording date can't be in the future.")
+    return value
 
 
 def engine_config(cfg: dict, data_dir: Path) -> dict:
@@ -192,28 +208,54 @@ class KnownPeople:
             return PrototypeGallery(labels, np.stack([self.prototypes[k] for k in labels]),
                                     {"model": self.model, "date": "dashboard"})
 
-    def _staff(self) -> List[dict]:
-        if not self.staff_gallery.exists():
+    def _staff_data(self, day: Optional[str] = None) -> tuple:
+        """(gallery file, its pickle) for one enrolled day, or the default gallery when day is None."""
+        if day is None:
+            f = self.staff_gallery
+        elif is_iso_date(day):
+            f = self.staff_gallery.parent / day / self.staff_gallery.name
+        else:
+            return None, {}
+        if not f.exists():
+            return None, {}
+        try:
+            with open(f, "rb") as fh:
+                return f, pickle.load(fh)
+        except Exception as exc:
+            logger.warning("Could not read staff gallery %s (%s)", f, exc)
+            return None, {}
+
+    def _staff(self, day: Optional[str] = None) -> List[dict]:
+        f, data = self._staff_data(day)
+        if f is None:
             return []
-        with open(self.staff_gallery, "rb") as f:
-            data = pickle.load(f)
-        date = data.get("meta", {}).get("date")
+        date = data.get("meta", {}).get("date", day)
         out = []
         for label in data.get("prototypes", {}):
-            folder = self.staff_dir(label)
+            folder = self._label_dir(f, data, label)
             photos = sorted(p.name for p in folder.glob("*.jpg")) if folder else []
             out.append({"label": label, "name": display_name(label), "photos": photos, "date": date})
         return out
 
-    def staff_dir(self, label: str) -> Optional[Path]:
-        if not self.staff_gallery.exists():
+    def _label_dir(self, f: Path, data: dict, label: str) -> Optional[Path]:
+        if label not in data.get("prototypes", {}):
+            return None          # also stops '..' style labels from leaving the gallery folder
+        meta = data.get("meta", {})
+        date = meta.get("date")
+        folder = meta.get("folders", {}).get(label, label)   # dashboard-built days map label → folder
+        if Path(folder).name != folder or folder in ("", ".", ".."):
             return None
-        with open(self.staff_gallery, "rb") as f:
-            date = pickle.load(f).get("meta", {}).get("date")
-        for d in (self.staff_gallery.parent / str(date) / label, self.staff_gallery.parent / label):
+        for d in (f.parent / folder, self.staff_gallery.parent / str(date) / folder):
             if d.is_dir():
                 return d
         return None
+
+    def staff_dir(self, label: str, day: Optional[str] = None) -> Optional[Path]:
+        f, data = self._staff_data(day)
+        return self._label_dir(f, data, label) if f is not None else None
+
+    def default_staff_day(self) -> Optional[str]:
+        return self._staff_data()[1].get("meta", {}).get("date")
 
     def person_dir(self, name: str) -> Optional[Path]:
         info = self.info.get(name)
@@ -260,10 +302,11 @@ class KnownPeople:
             shutil.rmtree(self.dir / info["folder"], ignore_errors=True)
             self._save()
 
-    def listing(self) -> dict:
+    def listing(self, day: Optional[str] = None) -> dict:
         with self._lock:
             yours = [{"name": n, **{k: v for k, v in i.items() if k != "folder"}} for n, i in self.info.items()]
-        return {"yours": sorted(yours, key=lambda p: p["added"], reverse=True), "staff": self._staff()}
+        return {"yours": sorted(yours, key=lambda p: p["added"], reverse=True), "staff": self._staff(day),
+                "staff_day": day or self.default_staff_day()}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -419,8 +462,11 @@ class JobManager:
         self.jobs_dir = self.data_dir / "jobs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         reid = cfg.get("reid", {})
-        self.known = KnownPeople(self.data_dir / "known_people", reid.get("model", ""),
-                                 Path(reid.get("gallery_file", "enrolled_gallery/gallery_prototypes.pkl")))
+        self.reid_model = reid.get("model", "")
+        self.gallery_file = Path(reid.get("gallery_file", "enrolled_gallery/gallery_prototypes.pkl"))
+        self.known = KnownPeople(self.data_dir / "known_people", self.reid_model, self.gallery_file)
+        self._galleries_cache: tuple = (None, [])
+        self._enroll_lock = threading.Lock()
         self.engine = None
         self.engine_state = "loading"
         self.engine_error: Optional[str] = None
@@ -483,11 +529,23 @@ class JobManager:
             waiting = sum(1 for j in self._jobs.values() if j["status"] == "queued")
         return {"engine": self.engine_state, "error": self.engine_error, "running": running, "waiting": waiting}
 
-    def create(self, filename: str, save_upload) -> dict:
+    def galleries(self) -> List[dict]:
+        """Enrolled staff days ({date, staff, usable, problem}); re-read only when a gallery file changes."""
+        root = self.gallery_file.parent
+        files = sorted(root.glob(f"*/{self.gallery_file.name}")) if root.is_dir() else []
+        key = tuple((str(f), f.stat().st_mtime_ns) for f in files)
+        if key != self._galleries_cache[0]:
+            self._galleries_cache = (key, list_day_galleries(self.gallery_file, self.reid_model))
+        return copy.deepcopy(self._galleries_cache[1])
+
+    def create(self, filename: str, save_upload, video_date: Optional[str] = None,
+               filename_date: Optional[str] = None) -> dict:
         ext = Path(filename).suffix.lower()
         if ext not in VIDEO_EXTS:
             raise ValueError(f"“{filename}” isn't a supported video. Use one of: "
                              + ", ".join(sorted(e.lstrip('.') for e in VIDEO_EXTS)) + ".")
+        video_date = check_video_date(video_date)
+        filename_date = filename_date if is_iso_date(filename_date) else date_in_name(filename)
         job_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
         d = self.jobs_dir / job_id
         d.mkdir(parents=True)
@@ -499,7 +557,8 @@ class JobManager:
             raise
         job = {"id": job_id, "name": filename, "video": filename, "created": datetime.now().isoformat(timespec="seconds"),
                "size_mb": round(path.stat().st_size / 2**20, 1), "status": "queued", "stage": "Waiting in line",
-               "progress": 0.0, "eta": None, "error": None, "summary": None, "people": [], "events": []}
+               "progress": 0.0, "eta": None, "error": None, "summary": None, "people": [], "events": [],
+               "video_date": video_date, "filename_date": filename_date, "gallery": None}
         with self._lock:
             self._jobs[job_id] = job
             self._save(job)
@@ -541,6 +600,81 @@ class JobManager:
                                            job["summary"]["processing_s"])
             self._save(job)
             return copy.deepcopy(person)
+
+    # ── staff enrollment from a morning check-in video ────────────────────────
+
+    def _enroll_job(self, job_id: str) -> dict:
+        job = self.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if not self.s.get("staff_enrollment", True):
+            raise EnrollmentError("Building staff galleries from the dashboard is switched off "
+                                  "(config.yaml → web.staff_enrollment).")
+        if job["status"] != "done":
+            raise RuntimeError("Wait for the analysis to finish first.")
+        if not is_iso_date(job.get("video_date")):
+            raise EnrollmentError("This video has no recording date – upload it again and choose its date.")
+        return job
+
+    def _person_embs(self, job_id: str) -> Dict[str, np.ndarray]:
+        npz = self.jobs_dir / job_id / "people.npz"
+        if not npz.exists():
+            return {}
+        with np.load(npz) as data:
+            return {k: data[k] for k in data.files}
+
+    def _staff_labels(self) -> List[str]:
+        return all_staff_labels(self.gallery_file)
+
+    def _eligibility(self, person: dict, n_samples: int) -> Optional[str]:
+        return eligibility(person["status"], n_samples, int(self.s["enroll_min_samples"]))
+
+    def enroll_preview(self, job_id: str) -> dict:
+        """What building the recording day's staff gallery from this job would involve."""
+        job = self._enroll_job(job_id)
+        date = job["video_date"]
+        embs = self._person_embs(job_id)
+        existing = describe_existing(self.gallery_file, date, self.reid_model)
+        people = []
+        for p in job["people"]:
+            n = len(embs.get(p["id"], ()))
+            name = p.get("name") or ""
+            suggest = ("emp_" + name[4:]) if p["status"] == STATUS_KNOWN and name.startswith("Emp ") else (
+                name if p["status"] == STATUS_KNOWN else "")
+            people.append({"id": p["id"], "name": name, "status": p["status"], "photo": (p["photos"] or [None])[0],
+                           "samples": n, "problem": self._eligibility(p, n), "suggest": suggest})
+        return {"date": date, "existing": existing, "labels": self._staff_labels(), "people": people,
+                "samples": int(self.s["enroll_samples"]), "min_samples": int(self.s["enroll_min_samples"]),
+                "enrolled": job.get("enrolled")}
+
+    def enroll(self, job_id: str, assignments, mode: str = "merge") -> dict:
+        """
+        Build / update enrolled_gallery/<recording date>/ from labelled people of this job.
+        assignments: [{"person": "P01", "label": "emp_04"}, ...] (blank label = not enrolled).
+        All problems are reported together and nothing is written unless every person is fine.
+        """
+        with self._enroll_lock:
+            job = self._enroll_job(job_id)
+            date = job["video_date"]
+            people = {p["id"]: {**p, "photos": [self.jobs_dir / job_id / f for f in p["photos"]]}
+                      for p in job["people"]}
+            staff = build_staff(people, self._person_embs(job_id), assignments,
+                                k=int(self.s["enroll_samples"]), min_samples=int(self.s["enroll_min_samples"]),
+                                reserved={n.lower() for n in self.known.info})
+            by_label = {s["label"]: s["people"] for s in staff}
+
+            summary = write_day_gallery(self.gallery_file, date, staff, model=self.reid_model, mode=mode,
+                                        source=f"check-in video “{job['name']}”")
+            summary["people"] = {s["label"]: s["people"] for s in staff}
+            record = {"date": date, "mode": mode, "labels": sorted(by_label), "backup": summary["backup"],
+                      "at": datetime.now().isoformat(timespec="seconds")}
+            with self._lock:
+                live = self._jobs.get(job_id)
+                if live is not None:
+                    live["enrolled"] = record
+                    self._save(live)
+            logger.info("Job %s enrolled %d staff for %s (%s)", job_id, len(staff), date, mode)
+            return summary
 
     def suspects(self):
         if self.engine is not None:
@@ -597,6 +731,12 @@ class JobManager:
                 self._update(job_id, save=True, status="failed", stage="Failed",
                              error=f"Something went wrong while analysing this video ({exc}).")
 
+    @staticmethod
+    def _gallery_date(job: dict) -> str:
+        """Staff gallery for a job: the chosen recording date. Jobs from before the date was
+        required fall back to a date in the filename, else no staff (never another day's gallery)."""
+        return job.get("video_date") or job.get("filename_date") or date_in_name(job.get("video")) or NO_STAFF
+
     def _analyse(self, job_id: str, job: dict) -> dict:
         d = self.jobs_dir / job_id
         cap = cv2.VideoCapture(str(d / job["video"]))
@@ -611,7 +751,15 @@ class JobManager:
         engine = self.engine
 
         engine.extra_gallery = self.known.gallery()
-        engine.set_source(str(d / job["video"]), fps=out_fps)
+        engine.set_source(str(d / job["video"]), fps=out_fps, gallery_date=self._gallery_date(job))
+        gallery = dict(engine.gallery_report)
+        if not job.get("video_date"):
+            gallery["warning"] = " · ".join(filter(None, [
+                "This video was uploaded without a recording date",
+                gallery.get("warning") or ("analysed without enrolled staff" if gallery.get("how") == "none"
+                                           else f"used the date in the file name ({gallery.get('date')})")]))
+        self._update(job_id, save=True, gallery=gallery)
+        logger.info("Job %s: staff gallery %s", job_id, gallery)
         last_ev = max((e[0] for e in engine.events_since(0)), default=0)
 
         logs: Dict[int, TrackLog] = {}

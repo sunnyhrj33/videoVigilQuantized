@@ -22,7 +22,9 @@ from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 
-from webapp.pipeline import JobManager, web_settings
+from core.enrollment import EnrollmentError
+from core.open_set import is_iso_date
+from webapp.pipeline import JobManager, date_in_name, web_settings
 
 WEB = Path(__file__).resolve().parent
 ROOT = WEB.parent
@@ -70,11 +72,19 @@ def create_app(cfg: dict) -> Flask:
             return error("Choose a video file to upload.", 400)
         name = secure_filename(file.filename) or "video.mp4"
         try:
-            job = jobs.create(name, file.save)
+            # The date in the original name is read before secure_filename strips CHIRLA's ':'s;
+            # it is only a hint – the staff gallery follows the date the user chose.
+            job = jobs.create(name, file.save, video_date=request.form.get("video_date"),
+                              filename_date=date_in_name(file.filename))
         except ValueError as exc:
             return error(str(exc), 400)
-        logger.info("Upload: %s (%.1f MB) → job %s", name, job["size_mb"], job["id"])
+        logger.info("Upload: %s (%.1f MB, recorded %s) → job %s", name, job["size_mb"],
+                    job["video_date"], job["id"])
         return jsonify(job), 201
+
+    @app.get("/api/galleries")
+    def galleries():
+        return jsonify({"days": jobs.galleries(), "default": jobs.known.default_staff_day()})
 
     @app.get("/api/jobs/<job_id>")
     def get_job(job_id):
@@ -102,9 +112,40 @@ def create_app(cfg: dict) -> Flask:
             return error(str(exc), 400)
         return jsonify(person)
 
+    @app.get("/api/jobs/<job_id>/enroll")
+    def enroll_preview(job_id):
+        try:
+            return jsonify(jobs.enroll_preview(job_id))
+        except KeyError:
+            return error("That analysis doesn't exist (any more).", 404)
+        except RuntimeError as exc:
+            return error(str(exc), 409)
+        except EnrollmentError as exc:
+            return error(str(exc), 400)
+
+    @app.post("/api/jobs/<job_id>/enroll")
+    def enroll(job_id):
+        body = request.get_json(silent=True) or {}
+        try:
+            summary = jobs.enroll(job_id, body.get("assignments"), str(body.get("mode") or "merge"))
+        except KeyError:
+            return error("That analysis doesn't exist (any more).", 404)
+        except RuntimeError as exc:
+            return error(str(exc), 409)
+        except EnrollmentError as exc:
+            return error(str(exc), 400)
+        except OSError as exc:
+            logger.exception("Writing the staff gallery failed")
+            return error(f"The staff gallery could not be written ({exc.strerror or exc}). "
+                         f"The previous gallery was left in place – close anything using it and try again.", 500)
+        return jsonify(summary)
+
     @app.get("/api/known")
     def known():
-        listing = jobs.known.listing()
+        day = request.args.get("day") or None
+        if day is not None and not is_iso_date(day):
+            return error("Use a date like 2023-06-02.", 400)
+        listing = jobs.known.listing(day)
         gallery = jobs.suspects()
         listing["watchlist"] = [{"id": s.suspect_id, "name": s.label.title(), "reason": s.reason,
                                  "source": s.source, "created": s.created, "sightings": len(s.sightings),
@@ -144,8 +185,9 @@ def create_app(cfg: dict) -> Flask:
 
     @app.get("/media/staff/<label>/<file>")
     def staff_photo(label, file):
-        d = jobs.known.staff_dir(label)
-        return send_from_directory(d, file, max_age=86400) if d else error("Not found", 404)
+        d = jobs.known.staff_dir(label, request.args.get("day") or None)
+        # absolute: Flask resolves a relative folder against webapp/, not the working directory
+        return send_from_directory(d.resolve(), file, max_age=86400) if d else error("Not found", 404)
 
     @app.get("/media/watchlist/<sid>/<file>")
     def watch_photo(sid, file):

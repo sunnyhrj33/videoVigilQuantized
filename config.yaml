@@ -140,6 +140,11 @@ web:
   min_person_seconds: 1.0              # people on screen for less than this are dropped (noise)
   same_person_threshold: 0.75          # track-centroid cosine to merge two tracks into one person
   thumbs_per_person: 6
+  # "Morning check-in" enrollment: build a day's staff gallery from an analysed video
+  # (job page → Build staff gallery). Writes reid.gallery_file's folder/<date>/; backups in _backups/.
+  staff_enrollment: true       # false = the dashboard refuses to build staff galleries
+  enroll_samples: 5            # K views averaged into each person's daily prototype
+  enroll_min_samples: 3        # people with fewer clear views can't be enrolled
 
 # ── CHIRLA protocol ───────────────────────────
 chirla:
@@ -168,6 +173,18 @@ video:
   width:  1280                 # Output display width (px)
   height: 720                  # Output display height (px)
   target_fps: 30               # Cap playback FPS; 0 = uncapped
+  # Frames analysed per second of video, per camera (console: VIDEO SOURCE → Analysis rate).
+  # Lower = smoother playback but fewer looks at each person (slower, less certain identities).
+  # auto = every frame for one video, multi_camera_fps when a recorded day's cameras play together.
+  analysis_fps: auto           # auto | all | a number, e.g. 10
+  multi_camera_fps: 5          # what "auto" uses for several cameras at once
+
+# ── Recorded days (console: VIDEO SOURCE → Recorded day) ─
+# <root>/<YYYY-MM-DD>/<sequence>/camera_<N>_<date>-<time>.avi – all cameras of one
+# sequence play together, time-aligned from the start times in the file names.
+recordings:
+  root: recordings
+  cameras: 7                   # cameras expected per sequence (fewer → plays what exists + warning)
 
 # ── Visualisation ─────────────────────────────
 visualisation:

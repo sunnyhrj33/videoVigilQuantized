@@ -89,6 +89,30 @@ def sequence_dates(root: str | Path) -> Dict[str, str]:
     return out
 
 
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_NAME_DATE_RE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+
+
+def is_iso_date(value) -> bool:
+    """'2023-06-02' style calendar date (also guards the folder name built from it)."""
+    if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def date_in_name(name: Optional[str]) -> Optional[str]:
+    """First valid YYYY-MM-DD in a filename (e.g. CHIRLA 'camera_2_2023-06-02-11:14:26.avi'), else None.
+    Only a hint: the recording date of a user's video is chosen by the user."""
+    for m in _NAME_DATE_RE.finditer(str(name or "")):
+        if is_iso_date(m.group(1)):
+            return m.group(1)
+    return None
+
+
 def source_date(name: str) -> Optional[str]:
     """Recording date ('2023-06-02') of a CHIRLA video / exported clip, if parseable."""
     _, start = parse_video_name(name)

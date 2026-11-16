@@ -10,11 +10,13 @@ from __future__ import annotations
 import pickle
 import tkinter as tk
 from pathlib import Path
+from tkinter import messagebox
 
 from PIL import Image, ImageTk
 
 from console.theme import (ACCENT, BG, BORDER, CARD, FG, FG_DIM, FONT,
-                           ScrollFrame, combo)
+                           ScrollFrame, button, combo)
+from core.chirla import is_iso_date
 
 
 class GalleryTab(tk.Frame):
@@ -33,20 +35,30 @@ class GalleryTab(tk.Frame):
         self.gday_combo = combo(top, self.gday_var, [], width=14)
         self.gday_combo.pack(side="left")
         self.gday_combo.bind("<<ComboboxSelected>>", lambda e: self.render())
-        self.ginfo = tk.Label(top, text="", bg=BG, fg=FG_DIM, font=(FONT, 9))
-        self.ginfo.pack(side="left", padx=12)
+        button(top, "➕  Build from check-in video…", self._open_checkin, ACCENT).pack(side="right")
+        self.ginfo = tk.Label(top, text="", bg=BG, fg=FG_DIM, font=(FONT, 9), anchor="w", justify="left")
+        self.ginfo.pack(side="left", padx=12, fill="x", expand=True)
 
         self.gscroll = ScrollFrame(self, bg=BG)
         self.gscroll.grid(row=1, column=0, sticky="nsew", padx=4)
 
-    def load_days(self):
+    def _open_checkin(self):
+        from console.tabs.checkin_dialog import CheckinDialog
+        if self.app.checkin_busy:
+            messagebox.showinfo("Check-in", "A check-in is already being analysed.")
+            return
+        CheckinDialog(self.app, initial_day=self.gday_var.get() or None)
+
+    def load_days(self, select: str = None):
         root = Path(self.app.cfg["reid"]["gallery_file"]).parent
         days = sorted(
             p.name for p in root.iterdir()
-            if p.is_dir() and (p / "gallery_prototypes.pkl").exists()
+            if p.is_dir() and is_iso_date(p.name) and (p / "gallery_prototypes.pkl").exists()
         ) if root.exists() else []
         self.gday_combo.config(values=days)
-        if days and self.gday_var.get() not in days:
+        if select in days:
+            self.gday_var.set(select)
+        elif days and self.gday_var.get() not in days:
             demo = self.app.cfg.get("chirla", {}).get("demo_day")
             self.gday_var.set(demo if demo in days else days[0])
         self.render()
@@ -56,19 +68,22 @@ class GalleryTab(tk.Frame):
         self._thumbs = []
         day = self.gday_var.get()
         if not day:
-            tk.Label(self.gscroll.inner, text="No gallery yet – run Pipeline step 2.", bg=BG, fg=FG_DIM,
+            tk.Label(self.gscroll.inner, text="No gallery yet – run Pipeline step 2, or build one from a "
+                                              "morning check-in video (button above).", bg=BG, fg=FG_DIM,
                      font=(FONT, 11)).pack(pady=40)
             return
         gdir = Path(self.app.cfg["reid"]["gallery_file"]).parent / day
         try:
-            meta = pickle.loads((gdir / "gallery_prototypes.pkl").read_bytes()).get("meta", {})
+            data = pickle.loads((gdir / "gallery_prototypes.pkl").read_bytes())
         except Exception:
-            meta = {}
-        emps = sorted(p for p in gdir.iterdir() if p.is_dir())
-        self.ginfo.config(
-            text=f"{len(emps)} employees enrolled · model {meta.get('model', '?')} · "
-                 f"crops from each person's earliest footage that day"
-        )
+            data = {}
+        meta = data.get("meta", {})
+        names = {folder: label for label, folder in meta.get("folders", {}).items()}   # check-in built days
+        labels = set(data.get("prototypes", {}))
+        emps = sorted(p for p in gdir.iterdir() if p.is_dir() and (names.get(p.name, p.name) in labels or not labels))
+        how = (f"built from a check-in video ({meta.get('updated', '')[:16].replace('T', ' ')})"
+               if meta.get("built_by") == "dashboard check-in" else "crops from each person's earliest footage that day")
+        self.ginfo.config(text=f"{len(emps)} employees enrolled · model {meta.get('model', '?')} · {how}")
         grid = self.gscroll.inner
         ncol = 3
         for c in range(ncol):
@@ -78,9 +93,10 @@ class GalleryTab(tk.Frame):
             card.grid(row=i // ncol, column=i % ncol, sticky="nsew", padx=5, pady=5)
             head = tk.Frame(card, bg=CARD)
             head.pack(fill="x", padx=10, pady=(8, 4))
-            tk.Label(head, text=d.name.replace("emp_", "Emp "), bg=CARD, fg=ACCENT,
+            label = names.get(d.name, d.name)
+            tk.Label(head, text=label.replace("emp_", "Emp "), bg=CARD, fg=ACCENT,
                      font=(FONT, 11, "bold")).pack(side="left")
-            cut = meta.get("enroll_cutoff", {}).get(d.name)
+            cut = meta.get("enroll_cutoff", {}).get(label)
             if cut:
                 tk.Label(head, text=f"enrolled until {cut[0]} f{cut[1]}", bg=CARD, fg=FG_DIM,
                          font=(FONT, 8)).pack(side="right")

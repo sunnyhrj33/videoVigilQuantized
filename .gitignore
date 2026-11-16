@@ -54,7 +54,7 @@ output/
 logs/
 *.log
 cache/
-
+recordings/
 # Model caches and downloads (optional - comment out if tracking models)
 *.pt
 *.pth

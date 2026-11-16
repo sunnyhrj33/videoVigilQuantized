@@ -187,9 +187,29 @@ class ApiTests(unittest.TestCase):
         self.patch.stop()
         self.tmp.cleanup()
 
-    def upload(self, name, data=b"fake video"):
-        return self.client.post("/api/jobs", data={"video": (io.BytesIO(data), name)},
-                                content_type="multipart/form-data")
+    def upload(self, name, data=b"fake video", video_date="2023-07-26"):
+        form = {"video": (io.BytesIO(data), name)}
+        if video_date is not None:
+            form["video_date"] = video_date
+        return self.client.post("/api/jobs", data=form, content_type="multipart/form-data")
+
+    def test_upload_needs_a_valid_recording_date(self):
+        for bad, msg in ((None, "Choose the date"), ("", "Choose the date"), ("06/02/2023", "valid date"),
+                         ("2023-02-30", "valid date"), ("../../etc", "valid date"), ("2999-01-01", "future")):
+            r = self.upload("clip.mp4", video_date=bad)
+            self.assertEqual(r.status_code, 400, bad)
+            self.assertIn(msg, r.json["error"])
+        self.assertEqual(self.client.get("/api/jobs").json, [])
+
+    def test_upload_keeps_chosen_date_and_filename_hint(self):
+        r = self.upload("camera_2_2023-06-02-11:14:26.avi", video_date="2023-06-08")
+        self.assertEqual(r.status_code, 201, r.json)
+        self.assertEqual((r.json["video_date"], r.json["filename_date"]), ("2023-06-08", "2023-06-02"))
+
+    def test_galleries_endpoint(self):
+        data = self.client.get("/api/galleries").json
+        self.assertEqual(data["days"], [])
+        self.assertEqual(self.client.get("/api/known?day=nope").status_code, 400)
 
     def test_page_and_status(self):
         self.assertEqual(self.client.get("/").status_code, 200)

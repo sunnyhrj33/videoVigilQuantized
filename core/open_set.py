@@ -23,6 +23,7 @@ from typing import Callable, Deque, Dict, List, Optional
 import cv2
 import numpy as np
 
+from core.chirla import is_iso_date  # noqa: F401  (re-exported for callers of open_set)
 from core.geometry import l2n, sharpness
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,9 @@ STATUS_PENDING = "PENDING"
 STATUS_KNOWN = "KNOWN"
 STATUS_UNKNOWN = "UNKNOWN"
 
+EMB_DIM = 512                  # OSNet / ResNet Re-ID embedding size (empty-gallery placeholder)
+NO_STAFF = "none"              # gallery_date value: analyse without an enrolled staff gallery
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Enrolled gallery
@@ -49,18 +53,24 @@ class PrototypeGallery:
 
     def __init__(self, labels: List[str], prototypes: np.ndarray, meta: Optional[dict] = None):
         self.labels = list(labels)
-        self.prototypes = l2n(prototypes)
+        self.prototypes = l2n(np.asarray(prototypes, np.float32).reshape(len(self.labels), -1)
+                              if len(self.labels) else np.zeros((0, EMB_DIM), np.float32))
         self.meta = meta or {}
 
     def __len__(self) -> int:
         return len(self.labels)
 
     @classmethod
+    def empty(cls, meta: Optional[dict] = None) -> "PrototypeGallery":
+        """No enrolled identities: every tracklet is UNKNOWN (unless merged with named people)."""
+        return cls([], np.zeros((0, EMB_DIM), np.float32), meta)
+
+    @classmethod
     def load(cls, path: str | Path) -> "PrototypeGallery":
         with open(path, "rb") as f:
             data = pickle.load(f)
         labels = list(data["prototypes"].keys())
-        protos = np.stack([data["prototypes"][k] for k in labels])
+        protos = np.stack([data["prototypes"][k] for k in labels]) if labels else None
         logger.info("✓ Loaded enrolled gallery: %d identities from %s", len(labels), path)
         return cls(labels, protos, data.get("meta", {}))
 
@@ -72,9 +82,54 @@ class PrototypeGallery:
         """This gallery plus other's identities (other wins on a duplicate label)."""
         if not len(other):
             return self
+        if not len(self):
+            return PrototypeGallery(other.labels, other.prototypes, self.meta)
         keep = [i for i, label in enumerate(self.labels) if label not in set(other.labels)]
         return PrototypeGallery([self.labels[i] for i in keep] + other.labels,
                                 np.vstack([self.prototypes[keep], other.prototypes]), self.meta)
+
+
+def load_day_gallery(gallery_file: str | Path, date: str,
+                     model: Optional[str]) -> tuple[Optional[PrototypeGallery], Optional[str]]:
+    """
+    The staff gallery enrolled on `date` (enrolled_gallery/<date>/gallery_prototypes.pkl).
+    Returns (gallery, None), or (None, reason) when that day can't be used: not a
+    valid date, nobody enrolled, unreadable, or built with a different Re-ID model.
+    """
+    if not is_iso_date(date):
+        return None, f"“{date}” is not a valid date"
+    path = Path(gallery_file).parent / date / Path(gallery_file).name
+    if not path.exists():
+        return None, f"No staff are enrolled for {date}"
+    try:
+        gallery = PrototypeGallery.load(path)
+    except Exception as exc:
+        logger.warning("Could not read staff gallery %s (%s)", path, exc)
+        return None, f"The staff gallery for {date} could not be read"
+    built_with = gallery.meta.get("model")
+    if model and built_with and built_with != model:
+        logger.warning("Gallery %s was built with %s but Re-ID model is %s", path, built_with, model)
+        return None, (f"The staff gallery for {date} was built with a different Re-ID model "
+                      f"({built_with}) and needs rebuilding")
+    if not len(gallery):
+        return None, f"The staff gallery for {date} has no enrolled employees"
+    gallery.meta.setdefault("date", date)
+    return gallery, None
+
+
+def list_day_galleries(gallery_file: str | Path, model: Optional[str]) -> List[dict]:
+    """Every enrolled day: [{'date', 'staff', 'usable', 'problem'}], oldest first."""
+    root = Path(gallery_file).parent
+    out = []
+    if not root.is_dir():
+        return out
+    for d in sorted(p for p in root.iterdir() if p.is_dir() and is_iso_date(p.name)):
+        if not (d / Path(gallery_file).name).exists():
+            continue
+        gallery, problem = load_day_gallery(gallery_file, d.name, model)
+        out.append({"date": d.name, "staff": len(gallery) if gallery else 0,
+                    "usable": gallery is not None, "problem": problem})
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +353,12 @@ class TrackletManager:
         n = len(t.embs)
         ident = t.identity
         ident.n_crops = n
+
+        if not len(self.gallery):
+            # Nobody enrolled for this source: once seen clearly enough, everyone is UNKNOWN.
+            if n >= (1 if self.mode == "naive" else self.min_crops):
+                ident.status, ident.label, ident.confidence, ident.features = STATUS_UNKNOWN, None, 0.0, None
+            return
 
         if self.mode == "naive":
             sims = self.gallery.similarities(np.stack([t.embs[-1]]))[0]

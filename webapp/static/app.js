@@ -51,6 +51,34 @@ function when(iso) {
   return isNaN(d) ? "" : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
+// "2023-06-02" → "2 Jun 2023" (calendar day, no time-zone shift)
+function day(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
+  if (!m) return iso || "";
+  return new Date(+m[1], m[2] - 1, +m[3]).toLocaleDateString(undefined, { dateStyle: "medium" });
+}
+
+function todayIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// First real YYYY-MM-DD in a filename – only ever offered as a suggestion.
+function dateInName(name) {
+  for (const m of String(name || "").matchAll(/(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)/g)) {
+    const d = new Date(+m[1], m[2] - 1, +m[3]);
+    if (d.getFullYear() === +m[1] && d.getMonth() === m[2] - 1 && d.getDate() === +m[3]) return m[0];
+  }
+  return null;
+}
+
+let galleryDays = null;   // [{date, staff, usable, problem}] from /api/galleries
+async function loadGalleryDays(force = false) {
+  if (galleryDays && !force) return galleryDays;
+  try { galleryDays = (await api("/api/galleries")).days; } catch { galleryDays = galleryDays || []; }
+  return galleryDays;
+}
+
 function sureWord(p) {
   return p >= 0.85 ? "Very sure" : p >= 0.65 ? "Fairly sure" : "Not very sure";
 }
@@ -138,6 +166,7 @@ window.addEventListener("hashchange", route);
 // ── home: upload + past analyses ─────────────────────────────────────────────
 
 function renderHome() {
+  pendingFile = null;
   view.innerHTML = `
     <div class="page-head">
       <div>
@@ -146,18 +175,31 @@ function renderHome() {
       </div>
     </div>
     <div class="hero">
-      <label class="drop" id="drop">
-        <input type="file" id="file" accept="video/*,.mkv,.avi,.wmv" hidden>
-        <div class="big-icon">${ICON.upload}</div>
-        <strong>Drop a video here</strong>
-        <span class="muted">or <u>browse your computer</u> · MP4, MOV, AVI, MKV, WebM</span>
-        <div class="upload-progress" id="upload-progress" hidden>
-          <div class="bar"><span></span></div>
-          <p class="small muted" id="upload-text" style="margin:8px 0 0"></p>
-        </div>
-      </label>
+      <div class="upload-col">
+        <label class="drop" id="drop">
+          <input type="file" id="file" accept="video/*,.mkv,.avi,.wmv" hidden>
+          <div class="big-icon">${ICON.upload}</div>
+          <strong>Drop a video here</strong>
+          <span class="muted">or <u>browse your computer</u> · MP4, MOV, AVI, MKV, WebM</span>
+          <div class="upload-progress" id="upload-progress" hidden>
+            <div class="bar"><span></span></div>
+            <p class="small muted" id="upload-text" style="margin:8px 0 0"></p>
+          </div>
+        </label>
+        <form class="card upload-form" id="upload-form" hidden novalidate>
+          <div class="upload-file">${ICON.film}<strong id="up-name"></strong>
+            <span class="small muted" id="up-size"></span>
+            <button type="button" class="btn ghost" id="up-cancel" style="margin-left:auto">Cancel</button></div>
+          <label class="field">When was this video recorded?
+            <select class="input" id="up-day"></select></label>
+          <input type="date" class="input" id="up-other" max="${todayIso()}" hidden aria-label="Recording date">
+          <div class="small muted" id="up-hint" hidden></div>
+          <div class="note" id="up-note" hidden></div>
+          <button class="btn primary" type="submit" id="up-go" disabled>Start analysis</button>
+        </form>
+      </div>
       <div class="card steps">
-        <div class="step"><div class="step-num">1</div><div><h3>Upload</h3><p>Any security or phone recording. Videos are analysed one at a time, in order.</p></div></div>
+        <div class="step"><div class="step-num">1</div><div><h3>Upload</h3><p>Any security or phone recording. Choose the day it was recorded, so the staff enrolled that day are recognised. Videos are analysed one at a time, in order.</p></div></div>
         <div class="step"><div class="step-num">2</div><div><h3>We do the work</h3><p>People are detected, followed through the video and compared with everyone the system knows. Bags and laptops are watched too.</p></div></div>
         <div class="step"><div class="step-num">3</div><div><h3>Review the gallery</h3><p>See each person once, with photos and when they were on screen. Tell the system who unrecognised people are, and it will recognise them next time.</p></div></div>
       </div>
@@ -168,21 +210,126 @@ function renderHome() {
     </div>`;
 
   const drop = $("#drop"), input = $("#file");
-  input.addEventListener("change", () => input.files[0] && upload(input.files[0]));
+  input.addEventListener("change", () => { if (input.files[0]) chooseFile(input.files[0]); input.value = ""; });
   ["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
   ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
-  drop.addEventListener("drop", e => e.dataTransfer.files[0] && upload(e.dataTransfer.files[0]));
+  drop.addEventListener("drop", e => e.dataTransfer.files[0] && chooseFile(e.dataTransfer.files[0]));
+  bindUploadForm();
 
   loadJobs();
   setPoll(loadJobs, 2500);
 }
 
-function upload(file) {
+// ── upload step 2: the recording date (required – the file name is only a hint) ──
+
+let pendingFile = null;
+
+async function chooseFile(file) {
+  pendingFile = file;
+  const days = await loadGalleryDays(true);
+  if (pendingFile !== file || !$("#upload-form")) return;
+  const usable = days.filter(d => d.usable);
+  $("#up-name").textContent = file.name;
+  $("#up-name").title = file.name;
+  $("#up-size").textContent = `${(file.size / 2 ** 20).toFixed(1)} MB`;
+  $("#up-day").innerHTML = `<option value="" selected disabled>Choose the recording date…</option>`
+    + (usable.length ? `<optgroup label="Days with enrolled staff">${usable.map(d =>
+        `<option value="${esc(d.date)}">${esc(day(d.date))} · ${d.staff} staff</option>`).join("")}</optgroup>` : "")
+    + `<option value="other">${usable.length ? "Another date (no staff enrolled)…" : "Pick a date…"}</option>`;
+  $("#up-other").value = "";
+  $("#up-other").hidden = true;
+
+  const hint = $("#up-hint"), suggested = dateInName(file.name);
+  hint.hidden = !suggested;
+  if (suggested) {
+    hint.innerHTML = `The file name mentions <b>${esc(day(suggested))}</b>. <button type="button" class="link-btn" id="up-use">Use this date</button>`;
+    $("#up-use").addEventListener("click", () => setUploadDate(suggested));
+  }
+  $("#drop").hidden = true;
+  $("#upload-form").hidden = false;
+  updateUploadForm();
+  $("#up-day").focus();
+}
+
+function setUploadDate(iso) {
+  const sel = $("#up-day");
+  if ([...sel.options].some(o => o.value === iso)) {
+    sel.value = iso;
+    $("#up-other").hidden = true;
+  } else {
+    sel.value = "other";
+    $("#up-other").hidden = false;
+    $("#up-other").value = iso;
+  }
+  updateUploadForm();
+}
+
+function uploadDate() {
+  const v = $("#up-day").value;
+  return v === "other" ? $("#up-other").value : v;
+}
+
+function updateUploadForm() {
+  const iso = uploadDate(), note = $("#up-note"), go = $("#up-go");
+  const info = (galleryDays || []).find(d => d.date === iso);
+  const suggested = pendingFile && dateInName(pendingFile.name);
+  let text = "", warn = false, ok = !!iso;
+  if (!iso) {
+    text = $("#up-day").value === "other" ? "Pick the day the video was recorded." : "";
+  } else if (iso > todayIso()) {
+    text = "The recording date can't be in the future.";
+    warn = true; ok = false;
+  } else if (info && info.usable) {
+    text = `The ${info.staff} staff enrolled on ${day(iso)} will be recognised, plus anyone you've named.`;
+  } else {
+    text = `${info && info.problem ? info.problem : `No staff are enrolled for ${day(iso)}`}. `
+      + "Everyone will show as unrecognised, except people you've named.";
+    warn = true;
+  }
+  if (ok && suggested && suggested !== iso) {
+    text += ` The file name mentions ${day(suggested)}, so check that the date is right.`;
+    warn = true;
+  }
+  note.textContent = text;
+  note.className = "note" + (warn ? " warn" : "");
+  note.hidden = !text;
+  go.disabled = !ok;
+}
+
+function bindUploadForm() {
+  const form = $("#upload-form");
+  $("#up-day").addEventListener("change", () => {
+    const other = $("#up-day").value === "other";
+    $("#up-other").hidden = !other;
+    if (other) $("#up-other").focus();
+    updateUploadForm();
+  });
+  $("#up-other").addEventListener("input", updateUploadForm);
+  $("#up-cancel").addEventListener("click", resetUploadForm);
+  form.addEventListener("submit", e => {
+    e.preventDefault();
+    const iso = uploadDate();
+    if (!pendingFile || !iso || $("#up-go").disabled) return;
+    upload(pendingFile, iso);
+  });
+}
+
+function resetUploadForm() {
+  pendingFile = null;
+  if (!$("#upload-form")) return;
+  $("#upload-form").hidden = true;
+  $("#drop").hidden = false;
+}
+
+function upload(file, videoDate) {
   const drop = $("#drop"), box = $("#upload-progress"), bar = $("#upload-progress .bar span"), text = $("#upload-text");
+  $("#upload-form").hidden = true;
+  drop.hidden = false;
   drop.classList.add("busy");
   box.hidden = false;
   const form = new FormData();
   form.append("video", file);
+  form.append("video_date", videoDate);
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/jobs");
   xhr.upload.onprogress = e => {
@@ -196,14 +343,21 @@ function upload(file) {
     try { body = JSON.parse(xhr.responseText); } catch { /* ignore */ }
     if (xhr.status === 201) {
       toast("Uploaded – analysis started");
+      pendingFile = null;
       location.hash = "#/job/" + body.id;
     } else {
       toast(body.error || "Upload failed", true);
-      drop.classList.remove("busy");
-      box.hidden = true;
+      uploadFailed();
     }
   };
-  xhr.onerror = () => { toast("Upload failed – is the server running?", true); drop.classList.remove("busy"); box.hidden = true; };
+  xhr.onerror = () => { toast("Upload failed – is the server running?", true); uploadFailed(); };
+  // Keep the chosen file and date so the user can fix the problem and try again.
+  const uploadFailed = () => {
+    drop.classList.remove("busy");
+    box.hidden = true;
+    bar.style.width = "0";
+    if (pendingFile && $("#upload-form")) { drop.hidden = true; $("#upload-form").hidden = false; }
+  };
   text.textContent = `Uploading ${file.name}…`;
   xhr.send(form);
 }
@@ -241,7 +395,7 @@ function jobCard(j) {
       <div class="job-poster">${poster}</div>
       <div class="job-body">
         <div class="job-name" title="${esc(j.name)}">${esc(j.name)}</div>
-        <div class="small muted">${when(j.created)}${s ? " · " + duration(s.duration) + " video" : ""}</div>
+        <div class="small muted">${j.video_date ? "Recorded " + esc(day(j.video_date)) + " · " : ""}${when(j.created)}${s ? " · " + duration(s.duration) + " video" : ""}</div>
         <div class="job-meta">${meta}</div>
       </div></a>`;
 }
@@ -276,13 +430,37 @@ async function renderJob(id) {
   if (job === null || job.id !== id || job.status !== "done") setPoll(tick, 1500);
 }
 
+// Which staff gallery a job uses, and anything the user should double-check.
+function galleryLine(j) {
+  const g = j.gallery;
+  const parts = [j.video_date ? `Recorded ${esc(day(j.video_date))}` : ""];
+  if (g) {
+    parts.push(g.staff ? `${g.staff} staff enrolled that day` : "no staff gallery");
+    if (g.named) parts.push(`${g.named} ${g.named > 1 ? "people" : "person"} you named`);
+  }
+  return parts.filter(Boolean).join(" · ");
+}
+
+function galleryNotes(j) {
+  const notes = [];
+  if (j.gallery && j.gallery.warning) {
+    notes.push(`${j.gallery.warning}${j.gallery.staff ? "" : ". Everyone was treated as unrecognised, except people you named."}`);
+  }
+  if (j.video_date && j.filename_date && j.filename_date !== j.video_date) {
+    notes.push(`You chose ${day(j.video_date)} but the file name mentions ${day(j.filename_date)}. If the date is wrong, delete this analysis and upload it again with the right date.`);
+  }
+  return notes.length ? `<div class="page-notes">${notes.map(n => `<div class="note warn">${esc(n)}</div>`).join("")}</div>` : "";
+}
+
 function jobHeader(j, extra = "") {
+  const g = galleryLine(j);
   return `<a class="back" href="#/">${ICON.back} All analyses</a>
     <div class="page-head">
       <div><h1>${esc(j.name)}</h1>
-        <p class="sub">Uploaded ${when(j.created)} · ${j.size_mb} MB${extra}</p></div>
+        <p class="sub">Uploaded ${when(j.created)} · ${j.size_mb} MB${extra}</p>
+        ${g ? `<p class="sub small" style="margin-top:2px">${g}</p>` : ""}</div>
       <button class="btn danger" id="delete-job" ${j.status === "running" ? "disabled title='Wait for the analysis to finish'" : ""}>${ICON.trash} Delete</button>
-    </div>`;
+    </div>${galleryNotes(j)}`;
 }
 
 function bindDelete(j) {
@@ -318,7 +496,9 @@ function drawProgress(j, first) {
         <span>${waiting ? "" : pct + "%"}${j.eta ? " · about " + duration(j.eta) + " left" : ""}</span></div>
       <p class="muted small" style="margin:0">You can leave this page – the analysis keeps running and shows up under <a href="#/">Your analyses</a>.</p>
     </div>`;
-  if (first || !$(".processing")) {
+  const headKey = JSON.stringify([j.status, j.gallery]);   // gallery is known once analysis starts
+  if (first || !$(".processing") || headKey !== drawProgress.headKey) {
+    drawProgress.headKey = headKey;
     view.innerHTML = jobHeader(j) + html;
     bindDelete(j);
   } else {
@@ -356,6 +536,7 @@ function drawJob() {
         <div class="timeline-list" id="events"></div>
       </div>
     </div>
+    ${enrollCard(j)}
     <div class="section">
       <div class="section-head">
         <div><h2>People in this video</h2><p class="sub small">Each card is one person. Click a card for photos, when they were on screen, and to tell the system who they are.</p></div>
@@ -364,6 +545,7 @@ function drawJob() {
       <div id="people"></div>
     </div>`;
   bindDelete(j);
+  $("#enroll-btn")?.addEventListener("click", openEnroll);
   $("#event-filter").addEventListener("click", e => {
     const b = e.target.closest("button");
     if (!b) return;
@@ -373,6 +555,128 @@ function drawJob() {
   });
   drawEvents();
   drawPeople();
+}
+
+// ── staff enrollment from a morning check-in video ─────────────────────────
+
+function enrollCard(j) {
+  if (!j.video_date) return "";
+  const done = j.enrolled
+    ? `<div class="note warn" style="margin-top:10px">Used on ${esc(when(j.enrolled.at))} to enroll
+        ${j.enrolled.labels.length} staff for ${esc(day(j.enrolled.date))} (${esc(j.enrolled.labels.join(", "))}).
+        Don't use this same footage to test recognition – it would only be recognising its own enrollment photos.</div>`
+    : "";
+  return `<div class="card enroll-cta">
+      <div class="enroll-cta-row">
+        <div><h2>Morning check-in video?</h2>
+          <p class="sub small" style="margin:4px 0 0">Build the staff gallery for ${esc(day(j.video_date))} from the people in this
+          video. Staff are then recognised in every video recorded that day.</p></div>
+        <button class="btn" id="enroll-btn">${ICON.person} Build staff gallery…</button>
+      </div>${done}</div>`;
+}
+
+async function openEnroll() {
+  let pv;
+  try { pv = await api(`/api/jobs/${encodeURIComponent(job.id)}/enroll`); }
+  catch (e) { toast(e.message, true); return; }
+  const ex = pv.existing;
+  const canMerge = !ex || ex.can_merge;
+  const existing = ex ? `
+    <div class="note ${canMerge ? "" : "warn"}">
+      ${ex.unreadable ? `The current staff gallery for ${esc(day(pv.date))} can't be read, so it can only be replaced.`
+        : `${esc(day(pv.date))} already has ${ex.staff.length} staff (${esc(ex.staff.join(", ") || "none")}),
+           from ${esc(ex.built_by)}.${canMerge ? "" : ` It was built with another Re-ID model (${esc(ex.model)}), so it can only be replaced.`}`}
+      <div class="enroll-modes">
+        <label><input type="radio" name="enroll-mode" value="merge" ${canMerge ? "checked" : "disabled"}>
+          Add or update these people, and keep the others</label>
+        <label><input type="radio" name="enroll-mode" value="replace" ${canMerge ? "" : "checked"}>
+          Replace the whole day with only these people</label>
+      </div>
+      <div class="small muted">The current gallery is backed up before anything changes.</div>
+    </div>` : `<div class="note">No staff are enrolled for ${esc(day(pv.date))} yet – this creates the day's gallery.</div>`;
+  const eligible = pv.people.filter(p => !p.problem);
+  const rows = pv.people.map(p => `
+    <div class="enroll-row ${p.problem ? "off" : ""}">
+      <div class="enroll-photo">${p.photo ? `<img src="/media/jobs/${esc(job.id)}/${esc(p.photo)}" alt="">` : ""}</div>
+      <div><div><b>${esc(p.name)}</b> ${chip(p.status)}</div>
+        <div class="small muted">${p.problem ? esc("Can't be enrolled: " + p.problem) : `${p.samples} clear views`}</div>
+        <div class="small enroll-hint" data-hint="${esc(p.id)}"></div></div>
+      <input class="input" list="staff-labels" data-person="${esc(p.id)}" maxlength="40" autocomplete="off"
+        placeholder="${p.problem ? "—" : "not enrolled"}" ${p.problem ? "disabled" : ""}
+        data-suggest="${esc(p.suggest || "")}" aria-label="Staff label for ${esc(p.name)}">
+    </div>`).join("");
+  openModal(`
+    <h2 id="modal-title">Build the staff gallery for ${esc(day(pv.date))}</h2>
+    <p class="muted" style="margin-top:-6px">Type each employee's staff label, such as <b>emp_04</b> or their name.
+      People you leave blank aren't enrolled. For each person the ${pv.samples} clearest, most varied views are averaged into their
+      gallery entry for this day. Use footage from the start of the day: people change clothes between days.</p>
+    ${existing}
+    <datalist id="staff-labels">${pv.labels.map(l => `<option value="${esc(l)}">`).join("")}</datalist>
+    <form id="enroll-form" class="enroll-form">
+      <div class="enroll-list">${rows || '<div class="note">No people were found in this video.</div>'}</div>
+      <div class="form-error" id="enroll-error" hidden></div>
+      <div class="enroll-actions">
+        ${eligible.some(p => p.suggest) ? '<button type="button" class="btn ghost" id="enroll-fill">Fill in recognised staff</button>' : ""}
+        <button class="btn primary" type="submit" ${eligible.length ? "" : "disabled"}>Build gallery</button>
+      </div>
+    </form>`);
+
+  const inputs = $$("#enroll-form input[data-person]");
+  const hint = () => {
+    const mode = $("input[name=enroll-mode]:checked")?.value || "merge";
+    const counts = {};
+    inputs.forEach(i => { const v = i.value.trim().toLowerCase(); if (v) counts[v] = (counts[v] || 0) + 1; });
+    inputs.forEach(i => {
+      const v = i.value.trim(), box = $(`[data-hint="${i.dataset.person}"]`);
+      let t = "";
+      if (v && counts[v.toLowerCase()] > 1) t = "Same label as another card: they'll be combined if they look alike.";
+      else if (v && ex && mode === "merge" && ex.staff.some(s => s.toLowerCase() === v.toLowerCase()))
+        t = `Replaces the current ${v} for this day.`;
+      box.textContent = t;
+    });
+  };
+  inputs.forEach(i => i.addEventListener("input", hint));
+  $$("input[name=enroll-mode]").forEach(r => r.addEventListener("change", hint));
+  $("#enroll-fill")?.addEventListener("click", () => {
+    inputs.forEach(i => { if (!i.disabled && !i.value && i.dataset.suggest) i.value = i.dataset.suggest; });
+    hint();
+  });
+  $("#enroll-form").addEventListener("submit", async e => {
+    e.preventDefault();
+    const err = $("#enroll-error"), btn = e.target.querySelector("button[type=submit]");
+    const assignments = inputs.filter(i => i.value.trim()).map(i => ({ person: i.dataset.person, label: i.value.trim() }));
+    const mode = $("input[name=enroll-mode]:checked")?.value || "merge";
+    err.hidden = true;
+    if (!assignments.length) { err.textContent = "Give at least one person a staff label."; err.hidden = false; return; }
+    if (ex && mode === "replace" && !confirm(`Replace the staff gallery for ${day(pv.date)}? Staff not in this video `
+        + `will no longer be recognised in videos from that day (a backup is kept).`)) return;
+    btn.disabled = true;
+    try {
+      const s = await api(`/api/jobs/${encodeURIComponent(job.id)}/enroll`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ assignments, mode }),
+      });
+      galleryDays = null;
+      job = await api("/api/jobs/" + encodeURIComponent(job.id));
+      const list = (xs) => xs.length ? esc(xs.join(", ")) : "none";
+      $("#modal-body").innerHTML = `
+        <h2 id="modal-title">Staff gallery saved for ${esc(day(s.date))}</h2>
+        <div class="facts">
+          <div class="fact"><div class="k">Added</div><div class="v">${list(s.added)}</div></div>
+          <div class="fact"><div class="k">Updated</div><div class="v">${list(s.replaced)}</div></div>
+          <div class="fact"><div class="k">Kept</div><div class="v">${list(s.kept)}</div></div>
+          ${s.removed.length ? `<div class="fact"><div class="k">Removed</div><div class="v">${list(s.removed)}</div></div>` : ""}
+        </div>
+        <p class="muted">${s.staff} staff are now enrolled for this day. Videos from ${esc(day(s.date))} that you upload or
+          analyse from now on recognise them.${s.backup ? " The previous gallery was backed up." : ""}</p>
+        <button class="btn primary" data-close>Done</button>`;
+      drawJob();
+      toast(`Staff gallery for ${day(s.date)} saved`);
+    } catch (ex2) {
+      err.textContent = ex2.message;
+      err.hidden = false;
+      btn.disabled = false;
+    }
+  });
 }
 
 function seek(t) {
@@ -490,15 +794,21 @@ function openPerson(pid) {
 
 // ── known people ─────────────────────────────────────────────────────────────
 
+let staffDay = null;      // day shown under "Enrolled staff" (null = default gallery)
+
 async function renderPeople() {
   view.innerHTML = `<div class="page-head"><div><h1>Known people</h1>
       <p class="sub">Everyone VideoVigil can recognise. Add people from any analysed video – open a person and choose “Remember this person”.</p></div></div>
     <div id="known"><div class="card empty">Loading…</div></div>`;
-  let data;
-  try { data = await api("/api/known"); } catch (e) { $("#known").innerHTML = `<div class="card empty">${esc(e.message)}</div>`; return; }
+  let data, days;
+  try {
+    [data, days] = await Promise.all([
+      api("/api/known" + (staffDay ? "?day=" + encodeURIComponent(staffDay) : "")), loadGalleryDays(true)]);
+  } catch (e) { $("#known").innerHTML = `<div class="card empty">${esc(e.message)}</div>`; return; }
+  const shownDay = data.staff_day;
 
-  const photos = (base, list) => `<div class="photos">${list.slice(0, 3).map(f =>
-    `<img src="${base}/${encodeURIComponent(f)}" alt="" loading="lazy">`).join("") || ""}</div>`;
+  const photos = (base, list, query = "") => `<div class="photos">${list.slice(0, 3).map(f =>
+    `<img src="${base}/${encodeURIComponent(f)}${query}" alt="" loading="lazy">`).join("") || ""}</div>`;
 
   const yours = data.yours.length
     ? `<div class="known-grid">${data.yours.map(p => `<div class="card known-card">
@@ -516,18 +826,26 @@ async function renderPeople() {
         <div class="small muted">First seen in “${esc(s.source)}”${s.sightings ? ` · seen ${s.sightings} more time${s.sightings > 1 ? "s" : ""}` : ""}</div></div>`).join("")}</div>`
     : `<div class="card empty">Nobody is on the watch list.</div>`;
 
+  const staffQuery = shownDay ? "?day=" + encodeURIComponent(shownDay) : "";
   const staff = data.staff.length
     ? `<div class="known-grid">${data.staff.map(p => `<div class="card known-card">
-        ${photos("/media/staff/" + encodeURIComponent(p.label), p.photos)}
+        ${photos("/media/staff/" + encodeURIComponent(p.label), p.photos, staffQuery)}
         <h3>${esc(p.name)}</h3></div>`).join("")}</div>`
-    : `<div class="card empty">No staff enrolled.</div>`;
+    : `<div class="card empty">${shownDay ? `No staff enrolled on ${esc(day(shownDay))}.` : "No staff enrolled."}</div>`;
+  const dayPicker = days.length
+    ? `<label class="staff-day small muted">Day
+        <select class="input" id="staff-day">${days.map(d => `<option value="${esc(d.date)}" ${d.date === shownDay ? "selected" : ""}>
+          ${esc(day(d.date))} · ${d.staff} staff${d.usable ? "" : " (can't be used)"}</option>`).join("")}</select></label>`
+    : "";
 
   $("#known").innerHTML = `
     <div class="section" style="margin-top:0"><div class="section-head"><h2>Named by you · ${data.yours.length}</h2></div>${yours}</div>
     <div class="section"><div class="section-head"><div><h2>Watch list · ${data.watchlist.length}</h2>
       <p class="sub small">Added automatically when an unrecognised person moves or lingers at a bag or laptop. They're flagged in red if they show up again.</p></div></div>${watch}</div>
     <div class="section"><div class="section-head"><div><h2>Enrolled staff · ${data.staff.length}</h2>
-      <p class="sub small">Set up by your administrator. For recordings named with a date, the staff enrolled on that day are used.</p></div></div>${staff}</div>`;
+      <p class="sub small">Set up by your administrator, once per day, because people wear different clothes on different days. Each video is checked against the staff enrolled on the recording date you choose when uploading.</p></div>
+      ${dayPicker}</div>${staff}</div>`;
+  $("#staff-day")?.addEventListener("change", e => { staffDay = e.target.value; renderPeople(); });
 
   $$("[data-forget]").forEach(b => b.addEventListener("click", async () => {
     const name = b.dataset.forget;
@@ -556,6 +874,7 @@ function renderHelp() {
         <p>Every frame is scanned for people, bags, backpacks and laptops. Each person is followed as they move, so one walk across the room counts as one person.</p></div>
       <div class="card"><h2>2 · Recognising them</h2>
         <p>Several clear views of each person are compared with everyone the system knows. It only says “Recognised” once those views agree – a single lucky look isn't enough.</p>
+        <p>Staff are compared with photos taken on the day the video was recorded, because people wear different clothes on different days. That's why you're asked for the recording date when you upload. If no staff were enrolled that day, everyone shows as unrecognised, except people you've named.</p>
         <ul><li><b>Recognised</b> – matches a known person.</li><li><b>Unrecognised</b> – doesn't match anyone known.</li>
         <li><b>Not enough view</b> – too small, blurry or brief to decide.</li></ul></div>
       <div class="card"><h2>3 · Building the gallery</h2>

@@ -235,6 +235,36 @@ h3 { font-size: 15px; margin: 0; }
 .form-error { color: var(--alert); font-size: 13.5px; }
 .note { padding: 12px 14px; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text-2); font-size: 14px; }
 .note.error { background: var(--alert-soft); color: var(--alert); }
+.note.warn { background: var(--unknown-soft); color: var(--text); border-left: 3px solid var(--unknown); }
+.page-notes { display: grid; gap: 8px; margin: -6px 0 18px; }
+
+/* ── upload: recording date ───────────────────────────────────────────────── */
+.upload-col { display: grid; gap: 14px; align-content: start; }
+.upload-form { padding: 18px 20px; display: grid; gap: 12px; }
+.upload-file { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.upload-file strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.field { display: grid; gap: 6px; font-weight: 600; }
+.field .input { width: 100%; font: inherit; font-weight: 400; color: var(--text); }
+.link-btn { border: 0; background: none; padding: 0; color: var(--accent); font: inherit; font-weight: 600; cursor: pointer; text-decoration: underline; }
+.staff-day { display: flex; align-items: center; gap: 8px; }
+
+/* ── staff enrollment (morning check-in) ──────────────────────────────────── */
+.enroll-cta { padding: 16px 20px; margin-top: 20px; }
+.enroll-cta-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.enroll-cta h2 { margin: 0; }
+.enroll-modes { display: grid; gap: 6px; margin: 10px 0 6px; color: var(--text); }
+.enroll-modes label { display: flex; gap: 8px; align-items: center; cursor: pointer; }
+.enroll-form { display: grid; gap: 12px; margin-top: 14px; }
+.enroll-list { display: grid; gap: 8px; max-height: 46vh; overflow: auto; padding-right: 4px; }
+.enroll-row { display: grid; grid-template-columns: 48px 1fr minmax(150px, 210px); gap: 12px; align-items: center;
+  padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.enroll-row.off { opacity: .6; }
+.enroll-photo { width: 48px; height: 72px; border-radius: 6px; overflow: hidden; background: var(--surface-2); }
+.enroll-photo img { width: 100%; height: 100%; object-fit: cover; }
+.enroll-hint { color: var(--unknown); }
+.enroll-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.form-error { white-space: pre-line; }
+.staff-day .input { min-width: 0; width: auto; flex: none; font: inherit; color: var(--text); }
 
 /* ── known people ────────────────────────────────────────────────────────── */
 .known-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
