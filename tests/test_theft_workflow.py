@@ -1,6 +1,5 @@
 """
-Scripted-scenario tests for the theft workflow (CHIRLA contains no staged theft,
-so displacement logic is verified with synthetic box trajectories).
+Scripted-scenario tests for the theft workflow and shared core geometry / detector helpers.
 
 Run:  python -m unittest discover -s tests -v
 """
@@ -14,8 +13,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from security import ABANDONED, IN_TRANSIT, MISSING, SECURED, AssetMonitor  # noqa: E402
-from suspects import SuspectGallery, TrackHistory, entry_side  # noqa: E402
+from core.detector import get_available_trackers  # noqa: E402
+from core.geometry import area, centre, iou, overlap_ratio, sharpness  # noqa: E402
+from core.reid import REID_MODELS  # noqa: E402
+from core.security import ABANDONED, IN_TRANSIT, MISSING, SECURED, AssetMonitor  # noqa: E402
+from core.suspects import SuspectGallery, TrackHistory, entry_side  # noqa: E402
 
 LAPTOP = (540, 280, 680, 410)          # home anchor (the document's example box)
 
@@ -43,6 +45,26 @@ def run(m, frames, fps=30.0):
     return events
 
 
+class CoreHelpersTests(unittest.TestCase):
+    def test_geometry_helpers(self):
+        a = (0, 0, 100, 100)
+        b = (50, 50, 150, 150)
+        self.assertEqual(centre(a), (50.0, 50.0))
+        self.assertEqual(area(a), 10000.0)
+        self.assertAlmostEqual(iou(a, b), 2500.0 / 17500.0, places=5)
+        self.assertAlmostEqual(overlap_ratio(a, b), 0.25, places=5)
+        blank = np.zeros((128, 64, 3), dtype=np.uint8)
+        self.assertEqual(sharpness(blank), 0.0)
+
+    def test_trackers_and_reid_models(self):
+        trackers = get_available_trackers()
+        self.assertIn("bytetrack", trackers)
+        self.assertIn("botsort", trackers)
+        self.assertNotIn("strongsort", trackers)
+        self.assertIn("osnet_ain_x1_0", REID_MODELS)
+        self.assertNotIn("fastraid", REID_MODELS)
+
+
 class AssetDisplacementTests(unittest.TestCase):
     def test_configured_anchor_registered(self):
         m = monitor()
@@ -61,7 +83,7 @@ class AssetDisplacementTests(unittest.TestCase):
         """A seated person covering half the laptop shifts its box centre, but the box area
         changes a lot → must not be taken as movement."""
         m = monitor()
-        half = (LAPTOP[0], LAPTOP[1], LAPTOP[0] + 40, LAPTOP[1] + 40)    # centre moves > 35 px
+        half = (LAPTOP[0], LAPTOP[1], LAPTOP[0] + 40, LAPTOP[1] + 40)
         person = (500, 200, 700, 600)
         ev = run(m, [(LAPTOP, [])] * 10 + [(half, [(1, person, "UNKNOWN", None)])] * 60)
         self.assertNotIn("displacement", [e.kind for e in ev])
@@ -69,11 +91,11 @@ class AssetDisplacementTests(unittest.TestCase):
     def test_unknown_moves_laptop_then_abandons(self):
         m = monitor()
         frames = [(LAPTOP, [])] * 10
-        for k in range(30):                                   # carried 4 px / frame to the right
+        for k in range(30):
             lap = shift(LAPTOP, 4 * k)
             frames.append((lap, [(7, (lap[0] - 40, 150, lap[2] + 40, 650), "UNKNOWN", None)]))
         dropped = shift(LAPTOP, 120)
-        frames += [(dropped, [])] * 60                        # walks away without it
+        frames += [(dropped, [])] * 60
         ev = run(m, frames)
         kinds = [e.kind for e in ev]
         self.assertIn("displacement", kinds)
@@ -102,7 +124,7 @@ class AssetDisplacementTests(unittest.TestCase):
         for k in range(15):
             lap = shift(LAPTOP, 6 * k)
             frames.append((lap, [(9, (lap[0] - 40, 150, lap[2] + 40, 650), "UNKNOWN", None)]))
-        frames += [(None, [])] * 100                          # gone
+        frames += [(None, [])] * 100
         ev = run(m, frames)
         missing = [e for e in ev if e.kind == "missing"]
         self.assertEqual(len(missing), 1)
@@ -124,7 +146,7 @@ class AssetDisplacementTests(unittest.TestCase):
         m = monitor()
         person = (500, 200, 700, 600)
         frames = []
-        for f in range(240):                                  # 8 s, person missed every 10th frame
+        for f in range(240):
             frames.append((LAPTOP, [] if f % 10 == 0 else [(4, person, "UNKNOWN", None)]))
         ev = run(m, frames)
         self.assertEqual([e.kind for e in ev].count("unknown_interaction"), 1)
@@ -156,7 +178,7 @@ class SuspectGalleryTests(unittest.TestCase):
                     camera="Cam_04", source="clip.mp4", frame=10, reason="displacement")
         self.assertEqual(s.suspect_id, "SUSPECT_01")
         self.assertAlmostEqual(float(np.linalg.norm(g.prototypes["SUSPECT_01"])), 1.0, places=5)
-        g2 = SuspectGallery(self.tmp.name, match_thresh=0.75)          # reload from disk
+        g2 = SuspectGallery(self.tmp.name, match_thresh=0.75)
         sid, sim = g2.match(np.stack([self.noise(self.person_a) for _ in range(5)]))
         self.assertEqual(sid, "SUSPECT_01")
         self.assertGreater(sim, 0.75)

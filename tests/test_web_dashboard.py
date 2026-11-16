@@ -17,9 +17,17 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from open_set import PrototypeGallery, l2n  # noqa: E402
-from web_pipeline import (STATUS_SUSPECT, STATUS_UNCLEAR, JobManager, KnownPeople, TrackLog,  # noqa: E402
-                          best_spread, group_tracks, group_verdict, segments)
+from core.geometry import l2n  # noqa: E402
+from core.open_set import PrototypeGallery  # noqa: E402
+from webapp.pipeline import (STATUS_SUSPECT, STATUS_UNCLEAR, JobManager,  # noqa: E402
+                             KnownPeople, TrackLog, best_spread, group_tracks,
+                             group_verdict, segments)
+
+try:
+    import flask  # noqa: F401
+    HAS_FLASK = True
+except ImportError:
+    HAS_FLASK = False
 
 RNG = np.random.default_rng(0)
 
@@ -55,7 +63,6 @@ class GroupTracksTests(unittest.TestCase):
         self.assertEqual(group_tracks(tracks, 0.75), [[0, 1]])
 
     def test_two_different_names_never_join_through_an_unknown(self):
-        # the unknown track looks like both, but Emp 04 and Emp 05 must stay separate people
         tracks = [track("KNOWN", "Emp 04", vec(1), range(0, 30)),
                   track("UNKNOWN", "UNKNOWN", vec(1, 0.05), range(40, 60)),
                   track("KNOWN", "Emp 05", vec(1, 0.05), range(70, 90))]
@@ -130,7 +137,7 @@ class KnownPeopleTests(unittest.TestCase):
         self.assertEqual(listing["staff"][0]["name"], "Emp 04")
         self.assertEqual(listing["staff"][0]["photos"], ["crop1.jpg"])
 
-        again = KnownPeople(self.root / "known", "osnet_ain_x1_0", self.staff)     # persisted
+        again = KnownPeople(self.root / "known", "osnet_ain_x1_0", self.staff)
         self.assertEqual(again.gallery().labels, ["Sara Khan"])
         again.remove("Sara Khan")
         self.assertIsNone(again.gallery())
@@ -158,6 +165,7 @@ class KnownPeopleTests(unittest.TestCase):
         self.assertEqual(merged.labels[int(np.argmax(sims))], "Ali")
 
 
+@unittest.skipUnless(HAS_FLASK, "flask is not installed in this Python environment")
 class ApiTests(unittest.TestCase):
     """HTTP API with the analysis worker stubbed out (jobs stay queued, no models load)."""
 
@@ -171,7 +179,7 @@ class ApiTests(unittest.TestCase):
                "reid": {"model": "osnet_ain_x1_0", "gallery_file": str(staff)}}
         self.patch = mock.patch.object(JobManager, "_worker", lambda self: None)
         self.patch.start()
-        from web_app import create_app
+        from webapp.server import create_app
         self.app = create_app(cfg)
         self.client = self.app.test_client()
 

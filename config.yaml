@@ -27,7 +27,7 @@ detection:
 
 # ── Tracking & Tracklet Settings ─────────────
 tracking:
-  tracker: bytetrack           # Tracker backend: bytetrack | botsort | ocsort | strongsort | trackformer
+  tracker: bytetrack           # Tracker backend: bytetrack | botsort
                                # (bytetrack ≈20 ms/frame faster than botsort on this CPU)
   track_high_thresh: 0.5       # High-confidence detection threshold for new tracks
   track_low_thresh: 0.1        # Low-confidence threshold (second association)
@@ -41,8 +41,8 @@ tracking:
 # ── Re-ID & Open-Set Classification ──────────
 reid:
   enabled: true
-  # Available models: osnet_ain_x1_0, osnet_x1_0, osnet_x0_25, resnet50, resnet101
-  # fastraid, transreid, vitreid (requires torchreid / fast-reid / timm)
+  # Available models (torchreid + OpenVINO):
+  # osnet_ain_x1_0, osnet_x1_0, osnet_x0_75, osnet_x0_5, osnet_x0_25, resnet50, resnet101
   model: osnet_ain_x1_0
   # Re-ID-trained checkpoint (file, or folder holding <model>_*.pth). Without it torchreid
   # falls back to ImageNet weights, which are NOT trained to tell people apart.
