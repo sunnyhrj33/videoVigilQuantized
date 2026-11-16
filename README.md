@@ -11,9 +11,18 @@ ByteTrack/BoTSORT tracking and Re-ID via a built-in EMA gallery.
 ```
 ├── app.py                   ← Security console (Tkinter): live monitor, pipeline, gallery,
 │                              evaluation, audit log, live log
+├── web_app.py               ← Web dashboard (Flask): upload a video → people gallery
+├── web_pipeline.py          ← Dashboard back end: job queue, track → person grouping, known people
+├── web/                     ← Dashboard page (index.html + static/app.js, app.css; no build step)
 ├── detection_engine.py      ← Detection + tracking + identity + zones/assets + overlays
 ├── open_set.py              ← Enrolled gallery, 5 tracklet features, open-set classifier
-├── security.py              ← Restricted zones, monitored assets, CSV audit logger
+├── security.py              ← Restricted zones, asset anchors / displacement, CSV audit logger
+├── suspects.py              ← Auto-enrolled suspect gallery, track history, forensic backtrack
+├── video_search.py          ← Video-wide person search: index recordings + ranked search
+├── console_tabs.py          ← Console tabs: Suspects, Video Search
+├── ui_theme.py              ← Console colours / fonts / widgets
+├── export_yolo_int8.py      ← YOLO INT8 re-quantisation at 480 px (CHIRLA-calibrated)
+├── tests/                   ← Theft-workflow + web-dashboard tests (python -m unittest discover -s tests)
 ├── chirla.py                ← CHIRLA dataset helpers (crops, dates, cameras)
 ├── export_reid_openvino.py  ← Pipeline 1: Re-ID model → OpenVINO
 ├── build_gallery.py         ← Pipeline 2: daily employee enrollment
@@ -60,6 +69,36 @@ python app.py
    video file.
 4. Adjust **Confidence** / **IoU** sliders and toggle **Show Trail** / **Re-ID**.
 5. Click **▶ START**.
+
+---
+
+## Web Dashboard (upload a video → people gallery)
+
+A simplified front end for non-technical users. They upload a recording; the
+full pipeline (detection → tracking → open-set identity → asset / suspect
+checks) runs on it and they get:
+
+- the **annotated video** (H.264 MP4, seekable in any browser);
+- a **people gallery** – one card per person, with their best photos, how long
+  they were on screen, and *Recognised / Unrecognised / Watch list / Not enough
+  view*. Tracks of the same person (tracker ID switches, leaving and coming
+  back) are merged by Re-ID centroid similarity, never when they are on screen
+  together;
+- an **activity timeline** (appearances, bag/laptop alerts) – click to seek;
+- **Remember this person**: naming an unrecognised person adds them to a
+  dashboard gallery that is merged into the enrolled gallery for every later
+  upload, so they come back as *Recognised*.
+
+```bash
+python web_app.py          # opens http://127.0.0.1:8000 (models load in the background)
+```
+
+Settings are fixed to the recommended ones (`config.yaml → web`): there are no
+model, tracker or threshold controls. Everything the dashboard writes – uploads,
+results, its own audit logs, known people and watch list – stays under
+`output/web/`, so the console's logs and suspect gallery are never touched.
+Videos are analysed one at a time, at `web.analysis_fps` (15) frames per second
+of video – about 1.5× the video's length on a 4-core CPU.
 
 ---
 
@@ -130,6 +169,79 @@ python app.py --demo demo2 --mode naive --start # open straight into a demo
 Live processing runs at ~7 FPS on a dual-core i5-6200U with `yolo11n_int8_480` (crowded
 scene; was 2 FPS) and **Real-time playback** keeps videos at true speed; **▶ Play smooth render**
 plays the offline-rendered version.
+
+---
+
+## Theft Workflow: Asset Displacement & Suspect Tracking
+
+Implements the FYP-2 "Spatiotemporal Asset Interaction & Automated Suspect Gallery
+Enrolment" design (`security.py`, `suspects.py`, `detection_engine.py`).
+
+1. **Static asset anchor** – each laptop / backpack / handbag gets a HOME box: from
+   `asset_monitoring.monitored_zones` in `config.yaml`, drawn in the console
+   (**✏ Draw laptop anchor**, saved to `output/asset_anchors.json`), or auto-registered
+   once a detected asset has been still for `anchor_frames`.
+2. **Displacement trigger** – `Δd = ‖centre(box) − centre(home)‖ > 35 px` for 5 frames in a
+   row, with a similar box size (so a person covering the laptop is not mistaken for
+   movement), while a person overlaps it (`Area(person ∩ asset) / Area(asset) > 0.25`).
+3. **Open-set decision** on the mover's tracklet: KNOWN → *"Authorized Relocation by
+   Emp_XX"*; UNKNOWN → *"CRITICAL: Unauthorized Asset Displacement"*; still identifying →
+   decided when the identity resolves (or treated as UNKNOWN after 6 s).
+4. **Auto-enrolment** – the mover's 8 tracklet crops become `SUSPECT_xx`
+   (`P_suspect = normalise(1/K Σ eᵢ)`), saved in `output/suspects/`. An unknown person
+   lingering at an asset (> 5 s) or a person flagged by the operator (**🚩 Flag suspect**)
+   is enrolled the same way.
+5. **Two-phase tracking** – while carrying: `SUSPECT 01 | CARRYING LAPTOP` (red) and
+   `LAPTOP: WITH SUSPECT 01` (cyan); afterwards `LAPTOP: ABANDONED AT (x, y)` / `MISSING`,
+   and the person `SUSPECT 01 | STATUS: UNARMED`. If the track is lost, new tracks are
+   matched against suspect prototypes → `SUSPECT 01 (RE-ID MATCH)`, also in other cameras
+   (the suspect gallery persists across sources). Suspect labels are continuously
+   re-verified and withdrawn if the tracker swaps IDs onto someone else.
+6. **Forensic backtrack** – `output/track_history.csv` (per track per second) and each
+   suspect's entry point: when and from which image edge they entered the view.
+7. **Theft audit log** – `output/theft_audit_log.csv`: THEFT_ALERT, AUTHORIZED_RELOCATION,
+   ASSET_ABANDONED / MISSING / SECURED, SUSPECT_ENROLLED, SUSPECT_REID, label withdrawals.
+
+Hand-over between people (asset custody chain) is planned future work.
+
+**Verification.** CHIRLA contains no staged theft, so the displacement state machine is
+covered by scripted-trajectory tests: `python -m unittest discover -s tests -v`
+(authorised relocation, theft + abandonment, missing, returned, occlusion is not movement,
+lingering alert across detection gaps, auto-anchoring, suspect gallery, backtrack).
+On Demo 3 the lingering visitor is auto-enrolled and re-identified after his track is
+lost; 14 of 15 suspect-labelled one-second samples match CHIRLA ground truth (the one
+miss is the instant of a tracker ID swap, after which the label is withdrawn).
+
+## Video-wide Search (find a person in recorded CCTV)
+
+`video_search.py` + console tab **🔎 Video Search**.
+
+- **Index** (once per recording day, ~15 min/day on an i5-6200U):
+  `python video_search.py index --day 2023-06-08` – every video is sampled at 2 fps, people
+  are tracked (ByteTrack) and stored as tracklets with an OSNet centroid embedding,
+  thumbnail, time span and P(Known). Output: `output/index/<date>/*.pkl`.
+- **Search** (instant): query = a suspect, an enrolled employee, a person selected in the
+  Live Monitor (**🔎 Search person**) or a photo. Results are ranked best-first, one per
+  track, with camera / time and **▶ Play from here**. Tracklets recognised as enrolled
+  employees can be excluded – the right default when hunting an unknown person.
+- **Why tracklets:** on CHIRLA single crops separate same / different people poorly
+  (cosine 0.66 vs 0.56 on average); tracklet centroids and ranking work much better.
+- **Results:** SUSPECT_01 (visitor 8, enrolled on camera 4) → 4 results on cameras 4, 5
+  and 6, all visitor 8 (with employees excluded). Ground-truth retrieval check
+  (`python video_search.py eval`, days 2023-06-08 + 2023-07-26, 4 visitor queries,
+  written to `output/search_eval.json` and shown in the Evaluation tab):
+
+  | Setting | Top-1 correct | Correct person in top 5 | mAP |
+  |---|---|---|---|
+  | Plain ranking | 75% | 75% | 24% |
+  | Employees excluded (default) | 75% | 100% | 18% |
+
+  The search reliably surfaces the person among the first results, but does not
+  retrieve every appearance (low mAP); excluding employees also drops some visitor
+  tracklets that are misjudged as employees. Only 4 queries – indicative, not conclusive.
+  Same-day only: people change clothes between CHIRLA days.
+
+Launch straight into a search: `python app.py --search SUSPECT_01`.
 
 ---
 

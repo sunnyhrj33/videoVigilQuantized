@@ -73,6 +73,14 @@ class PrototypeGallery:
         """(n, d) embeddings → (n, k) cosine similarities."""
         return l2n(embs) @ self.prototypes.T
 
+    def merged(self, other: "PrototypeGallery") -> "PrototypeGallery":
+        """This gallery plus other's identities (other wins on a duplicate label)."""
+        if not len(other):
+            return self
+        keep = [i for i, label in enumerate(self.labels) if label not in set(other.labels)]
+        return PrototypeGallery([self.labels[i] for i in keep] + other.labels,
+                                np.vstack([self.prototypes[keep], other.prototypes]), self.meta)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Tracklet features
@@ -161,6 +169,7 @@ class Identity:
 @dataclass
 class _Track:
     embs: Deque[np.ndarray]
+    thumbs: Deque[np.ndarray] = field(default_factory=lambda: deque(maxlen=10))   # 64×128 crops
     last_seen: int = 0
     last_sample: int = -10**9
     identity: Identity = field(default_factory=Identity)
@@ -220,6 +229,7 @@ class TrackletManager:
         self.min_sharpness = float(q.get("min_sharpness", 20.0))
         self.mode = reid_cfg.get("mode", "tracklet")
         self._tracks: Dict[int, _Track] = {}
+        self.watch: set = set()      # track ids always sampled at full rate (e.g. suspects)
 
     def reset(self):
         self._tracks.clear()
@@ -230,6 +240,13 @@ class TrackletManager:
         return (self.mode == "tracklet" and ident.status != STATUS_PENDING
                 and len(t.embs) >= self.window // 2
                 and abs(ident.confidence - self.p_thresh) >= self.settled_margin)
+
+    def track_data(self, tid: int):
+        """(embeddings (n, d), thumbnails [64×128 BGR]) of a track's tracklet buffer."""
+        t = self._tracks.get(tid)
+        if t is None or not t.embs:
+            return np.zeros((0, 512), np.float32), []
+        return np.stack(t.embs), list(t.thumbs)
 
     def set_gallery(self, gallery: PrototypeGallery):
         """Swap the enrolled gallery (e.g. per recording day); clears all tracklets."""
@@ -258,7 +275,7 @@ class TrackletManager:
             if t is None:
                 t = self._tracks[tid] = _Track(embs=deque(maxlen=self.window))
             t.last_seen = frame_idx
-            settled = self._is_settled(t)
+            settled = self._is_settled(t) and tid not in self.watch
             interval = self.settled_interval if settled else self.sample_interval
             overdue = frame_idx - t.last_sample - interval
             if overdue >= 0:
@@ -278,9 +295,10 @@ class TrackletManager:
 
         if to_embed:
             embs = self.embed_fn(to_embed)
-            for tid, e in zip(owners, embs):
+            for tid, e, crop in zip(owners, embs, to_embed):
                 t = self._tracks[tid]
                 t.embs.append(np.asarray(e, np.float32))
+                t.thumbs.append(cv2.resize(crop, (64, 128)))
                 self._decide(t)
 
         # Drop tracks that have been gone for a while.

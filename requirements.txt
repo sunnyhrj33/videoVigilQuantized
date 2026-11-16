@@ -14,6 +14,7 @@ tensorboard>=2.15           # torchreid import dependency (older versions fail t
 # ─── Object Detection & Tracking ──────────────────────────────────────────────────────
 ultralytics>=8.3.0          # YOLOv11 detection + native trackers (ByteTrack, BoTSORT)
 lap>=0.5.12                 # Linear assignment used by Ultralytics trackers
+nncf>=2.10                  # Optional: INT8 re-quantisation (export_yolo_int8.py)
 openvino>=2024.1.0          # Intel's optimized inference runtime (INT8, FP32 quantization)
 
 # ─── Kalman Filtering (for Official Tracker Implementations) ─────────────────────────
@@ -28,6 +29,10 @@ timm>=1.0.0                 # Timm models for Vision Transformer support (VitReI
 # ─── Image & Video Processing ────────────────────────────────────────────────────────
 opencv-python>=4.9.0        # Frame I/O, annotation, and OpenCV operations
 Pillow>=10.0.0              # Image processing (bridge to Tkinter GUI ImageTk module)
+
+# ─── Web Dashboard (web_app.py) ──────────────────────────────────────────────────────
+flask>=3.0                  # Upload-and-analyse web dashboard
+imageio-ffmpeg>=0.5         # Bundled ffmpeg: browser-playable H.264 output (OpenCV VP8 fallback is ~4x slower)
 
 # ─── Configuration Management ──────────────────────────────────────────────────────
 pyyaml>=6.0                 # YAML config file parsing and loading

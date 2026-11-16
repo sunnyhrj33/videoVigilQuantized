@@ -11,6 +11,7 @@ A Python application for real-time person/object detection, multi-object trackin
 | Module | Purpose |
 |--------|---------|
 | **app.py** | Tkinter GUI entry point; manages UI rendering, video sources, and configuration UI |
+| **web_app.py / web_pipeline.py** | Flask web dashboard for non-technical users: upload a video → annotated video, people gallery, "remember this person"; fixed settings from `config.yaml → web`, writes only under `output/web/` |
 | **detection_engine.py** | Core inference pipeline: YOLO detection → tracking → Re-ID feature extraction |
 | **system_utils.py** | System hardware detection and intelligent model recommendations |
 | **config.yaml** | Centralized configuration for detection, tracking, Re-ID, and hardware settings |

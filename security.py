@@ -24,8 +24,6 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from open_set import display_name
-
 logger = logging.getLogger(__name__)
 
 Box = Tuple[int, int, int, int]
@@ -93,125 +91,242 @@ class ZoneMonitor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Monitored assets
+#  Monitored assets (static anchor + spatial displacement)
 # ─────────────────────────────────────────────────────────────────────────────
+
+COCO_ASSETS = {24: "backpack", 26: "handbag", 63: "laptop"}
+
+SECURED = "SECURED"          # on its home anchor
+IN_TRANSIT = "IN_TRANSIT"    # displaced, a person (handler) is with it
+ABANDONED = "ABANDONED"      # displaced, nobody with it any more
+MISSING = "MISSING"          # gone from view (taken away / hidden)
+
+
+def centre(b: Box) -> Tuple[float, float]:
+    return (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+
+
+def area(b: Box) -> float:
+    return max(1.0, float((b[2] - b[0]) * (b[3] - b[1])))
+
 
 @dataclass
 class Asset:
     asset_id: int
+    name: str                      # e.g. "laptop_1" or a configured / drawn name
     class_name: str
-    box: Box
-    anchor: Box
+    home: Box                      # registered anchor (home) box
+    box: Box                       # last observed box
     last_seen: int
-    seen_count: int = 1
-    state: str = "Static"                 # Static | Moved by Emp XX | ALERT
-    holder: Optional[str] = None
+    origin: str = "auto"           # auto | config | drawn
+    status: str = SECURED
+    handler: Optional[int] = None  # track id of the person who displaced / carries it
+    moved_frames: int = 0          # consecutive frames beyond the displacement threshold
+    away_since: Optional[int] = None
+    last_toucher: Optional[Tuple[int, int]] = None      # (track id, frame)
     unknown_contact_since: Optional[float] = None
+    last_unknown_contact: Optional[float] = None
+    interaction_alerted: bool = False
+
+    @property
+    def displacement(self) -> float:
+        (hx, hy), (cx, cy) = centre(self.home), centre(self.box)
+        return float(np.hypot(cx - hx, cy - hy))
 
 
 @dataclass
 class AssetEvent:
     asset: Asset
-    track_id: int
-    kind: str          # "possession" | "displaced_unknown" | "unknown_interaction"
-    text: str
+    track_id: Optional[int]
+    kind: str          # displacement | returned | abandoned | missing | unknown_interaction
+    dist: float = 0.0
 
 
 class AssetMonitor:
     """
-    Keeps a registry of monitored objects matched frame-to-frame by IoU, so an
-    asset keeps its identity even if the tracker re-numbers it.
+    Static asset anchoring + displacement detection (FYP-2 theft workflow).
+
+    A monitored asset has a HOME anchor box (from config, drawn in the console,
+    or auto-registered once a detected laptop has been still for
+    `anchor_frames`). Each frame the asset's current box is compared to home:
+
+        delta_d = || centre(box) - centre(home) ||   (pixels)
+
+    If delta_d > displacement_threshold_px (for `confirm_frames` frames, with a
+    similar box size so occlusion is not mistaken for movement) and a person
+    overlaps the asset with Area(person ∩ asset) / Area(asset) > interaction
+    threshold → DISPLACEMENT by that person (IN_TRANSIT). The handler leaving
+    it → ABANDONED at (x, y); gone from view → MISSING; back home → SECURED.
     """
 
     def __init__(self, cfg: dict):
-        zcfg = cfg.get("security_zones", {}) or {}
-        self.rules = {a["class_name"]: a for a in (zcfg.get("monitored_assets") or [])}
-        acfg = cfg.get("assets", {}) or {}
-        self.overlap_thresh = float(acfg.get("overlap_thresh", 0.30))
-        self.move_thresh = float(acfg.get("move_thresh", 0.35))   # × anchor box diagonal
-        self.anchor_frames = int(acfg.get("anchor_frames", 15))
-        self.max_missing = int(acfg.get("max_missing_frames", 90))
+        a = cfg.get("asset_monitoring", {}) or {}
+        self.enabled = bool(a.get("enabled", True))
+        classes = a.get("target_asset_classes", [63])
+        self.classes = {COCO_ASSETS.get(c, str(c)) if isinstance(c, int) else str(c) for c in classes}
+        self.move_px = float(a.get("displacement_threshold_px", 35))
+        self.overlap_thresh = float(a.get("interaction_iou_thresh", 0.25))
+        self.confirm_frames = int(a.get("confirm_frames", 5))
+        self.anchor_frames = int(a.get("anchor_frames", 15))
+        self.abandon_frames = int(a.get("abandon_frames", 45))
+        self.missing_frames = int(a.get("missing_frames", 90))
+        self.stay_limit = float(a.get("unknown_stay_limit_seconds", 5))
+        self.allow_unknown = bool(a.get("allow_unknown_interaction", False))
+        self.contact_grace = float(a.get("contact_grace_seconds", 1.5))
+        self.configured = a.get("monitored_zones", {}) or {}
         self.assets: List[Asset] = []
+        self._pending: List[dict] = []            # auto-registration candidates
         self._next_id = 1
+
+    # ── setup ────────────────────────────────────────────────────────────────
 
     def reset(self):
         self.assets.clear()
+        self._pending.clear()
         self._next_id = 1
+
+    def configure(self, camera_key: Optional[str], drawn: Optional[Dict[str, List[int]]] = None):
+        """New source: register configured + console-drawn anchors for this camera."""
+        self.reset()
+        cam_cfg = self.configured.get(camera_key or "", {}) or {}
+        for origin, anchors in (("config", cam_cfg), ("drawn", drawn or {})):
+            for name, box in anchors.items():
+                self._add(tuple(int(v) for v in box), "laptop", origin, name=name, seen=-1)
+
+    def _add(self, box: Box, cls_name: str, origin: str, name: Optional[str] = None, seen: int = 0) -> Asset:
+        a = Asset(self._next_id, name or f"{cls_name}_{self._next_id}", cls_name, box, box, seen, origin)
+        self._next_id += 1
+        self.assets.append(a)
+        return a
+
+    # ── per frame ────────────────────────────────────────────────────────────
 
     def update(self, frame_idx: int, t_sec: float, objects: List[Tuple[str, Box]],
                persons: List[Tuple[int, Box, str, Optional[str]]]) -> List[AssetEvent]:
         """
-        objects: [(class_name, box)] for monitored classes.
-        persons: [(track_id, box, status, label)] with status KNOWN / UNKNOWN / PENDING.
+        objects: [(class_name, box)] from the detector.
+        persons: [(track_id, box, status, label)], status KNOWN / UNKNOWN / PENDING.
         """
-        # Match detections to the registry
-        for cls_name, box in objects:
-            if cls_name not in self.rules:
-                continue
-            best, best_iou = None, 0.2
-            for a in self.assets:
-                if a.class_name == cls_name and frame_idx - a.last_seen <= self.max_missing:
-                    v = iou(a.box, box)
-                    if v > best_iou:
-                        best, best_iou = a, v
-            if best is None:
-                self.assets.append(Asset(self._next_id, cls_name, box, box, frame_idx))
-                self._next_id += 1
-            else:
-                best.box = box
-                best.last_seen = frame_idx
-                best.seen_count += 1
-                if best.seen_count <= self.anchor_frames and best.state == "Static":
-                    best.anchor = box    # settle anchor while the object is still new
-
-        self.assets = [a for a in self.assets if frame_idx - a.last_seen <= self.max_missing]
+        if not self.enabled:
+            return []
+        dets = [(c, b) for c, b in objects if c in self.classes]
+        used = self._associate(dets, frame_idx)
+        self._auto_register([d for i, d in enumerate(dets) if i not in used], frame_idx)
 
         events: List[AssetEvent] = []
         for a in self.assets:
-            if a.last_seen != frame_idx or a.seen_count < self.anchor_frames:
-                continue
-            rule = self.rules[a.class_name]
+            visible = a.last_seen == frame_idx
             toucher = max(persons, key=lambda p: overlap_ratio(p[1], a.box), default=None)
             touching = toucher is not None and overlap_ratio(toucher[1], a.box) > self.overlap_thresh
-            moved = self._displacement(a) > self.move_thresh
-            name = a.class_name.capitalize()
-
-            if not touching:
-                a.unknown_contact_since = None
-                continue
-            tid, _, status, label = toucher
-
-            if moved and status == "KNOWN":
-                holder = display_name(label)
-                if a.holder != holder:
-                    a.holder = holder
-                    a.state = f"Moved by {holder}"
-                    events.append(AssetEvent(a, tid, "possession",
-                                             f"{name} in possession of {holder}"))
-            elif moved and status == "UNKNOWN":
-                if a.state != "ALERT":
-                    a.state = "ALERT"
-                    events.append(AssetEvent(a, tid, "displaced_unknown",
-                                             f"Security Alert: {name} Displaced by Unknown Person!"))
-
-            if status == "UNKNOWN" and not rule.get("allow_unknown_interaction", False):
-                if a.unknown_contact_since is None:
-                    a.unknown_contact_since = t_sec
-                limit = float(rule.get("zone_stay_limit_seconds", 5))
-                if t_sec - a.unknown_contact_since >= limit and a.state != "ALERT":
-                    a.state = "ALERT"
-                    events.append(AssetEvent(a, tid, "unknown_interaction",
-                                             f"Security Alert: Unknown Person at {name} > {limit:.0f}s"))
-            else:
-                a.unknown_contact_since = None
+            if touching:
+                a.last_toucher = (toucher[0], frame_idx)
+            events += self._step(a, frame_idx, visible, toucher if touching else None, persons)
+            ev = self._interaction(a, t_sec, toucher if touching else None)
+            if ev:
+                events.append(ev)
         return events
 
-    @staticmethod
-    def _displacement(a: Asset) -> float:
-        acx, acy = (a.anchor[0] + a.anchor[2]) / 2, (a.anchor[1] + a.anchor[3]) / 2
-        cx, cy = (a.box[0] + a.box[2]) / 2, (a.box[1] + a.box[3]) / 2
-        diag = max(1.0, float(np.hypot(a.anchor[2] - a.anchor[0], a.anchor[3] - a.anchor[1])))
-        return float(np.hypot(cx - acx, cy - acy)) / diag
+    def _associate(self, dets, frame_idx) -> set:
+        """Greedy match of detections to assets: IoU with last box, else nearest centre."""
+        used = set()
+        for a in sorted(self.assets, key=lambda x: x.status != IN_TRANSIT):
+            best, best_score = None, 0.0
+            diag = float(np.hypot(a.box[2] - a.box[0], a.box[3] - a.box[1]))
+            for i, (c, b) in enumerate(dets):
+                if i in used or c != a.class_name:
+                    continue
+                v = iou(a.box, b)
+                if v > 0.2:
+                    score = 1.0 + v
+                else:
+                    (ax, ay), (bx, by) = centre(a.box), centre(b)
+                    d = float(np.hypot(ax - bx, ay - by))
+                    reach = 1.5 * diag if a.status == IN_TRANSIT else 0.75 * diag
+                    score = 1.0 - d / reach if d < reach else 0.0
+                if score > best_score:
+                    best, best_score = i, score
+            if best is not None:
+                used.add(best)
+                a.box = dets[best][1]
+                a.last_seen = frame_idx
+        return used
+
+    def _auto_register(self, dets, frame_idx):
+        """A detection that stays still for anchor_frames becomes a monitored asset."""
+        keep = []
+        for c, b in dets:
+            if any(iou(a.home, b) > 0.3 or iou(a.box, b) > 0.3 for a in self.assets):
+                continue
+            cand = next((p for p in self._pending if p["cls"] == c and iou(p["box"], b) > 0.5), None)
+            if cand is None:
+                cand = {"cls": c, "box": b, "first": b, "count": 0}
+            (fx, fy), (bx, by) = centre(cand["first"]), centre(b)
+            cand["count"] = cand["count"] + 1 if np.hypot(bx - fx, by - fy) < self.move_px else 1
+            cand["box"], cand["last"] = b, frame_idx
+            if cand["count"] == 1:
+                cand["first"] = b
+            if cand["count"] >= self.anchor_frames:
+                self._add(b, c, "auto", seen=frame_idx)
+            else:
+                keep.append(cand)
+        self._pending = [p for p in keep if frame_idx - p.get("last", frame_idx) < 30]
+
+    def _step(self, a: Asset, f: int, visible: bool, toucher, persons) -> List[AssetEvent]:
+        ev: List[AssetEvent] = []
+        if not visible:
+            if a.status in (SECURED, IN_TRANSIT) and a.last_seen >= 0 and f - a.last_seen > self.missing_frames:
+                tid = a.handler if a.handler is not None else (a.last_toucher[0] if a.last_toucher else None)
+                a.status, a.handler = MISSING, tid
+                ev.append(AssetEvent(a, tid, "missing", a.displacement))
+            return ev
+
+        moved = a.displacement > self.move_px and 0.5 < area(a.box) / area(a.home) < 2.0
+        a.moved_frames = a.moved_frames + 1 if moved else 0
+        confirmed = a.moved_frames >= self.confirm_frames
+
+        if a.status == MISSING:
+            a.status = SECURED if not moved else (IN_TRANSIT if toucher else ABANDONED)
+            ev.append(AssetEvent(a, a.handler, "returned" if a.status == SECURED else "abandoned", a.displacement))
+            if a.status == SECURED:
+                a.handler = None
+        elif a.status == SECURED:
+            if confirmed and toucher is not None:
+                a.status, a.handler, a.away_since = IN_TRANSIT, toucher[0], None
+                ev.append(AssetEvent(a, toucher[0], "displacement", a.displacement))
+            elif confirmed and a.moved_frames > self.abandon_frames:
+                a.home, a.moved_frames = a.box, 0     # nudged with nobody around → re-anchor quietly
+        elif a.status in (IN_TRANSIT, ABANDONED):
+            if not moved:
+                a.status, a.handler, a.away_since = SECURED, None, None
+                ev.append(AssetEvent(a, None, "returned", 0.0))
+            elif a.status == IN_TRANSIT:
+                handler_near = any(p[0] == a.handler and overlap_ratio(p[1], a.box) > self.overlap_thresh
+                                   for p in persons)
+                if handler_near:
+                    a.away_since = None
+                else:
+                    a.away_since = a.away_since if a.away_since is not None else f
+                    if f - a.away_since >= self.abandon_frames:
+                        a.status = ABANDONED
+                        ev.append(AssetEvent(a, a.handler, "abandoned", a.displacement))
+            # ABANDONED + a different person picking it up = hand-over (future work)
+        return ev
+
+    def _interaction(self, a: Asset, t_sec: float, toucher) -> Optional[AssetEvent]:
+        """Unknown person lingering at an asset for > stay limit. Short detection gaps
+        (≤ contact_grace s, e.g. a seated person briefly missed) do not restart the timer."""
+        if toucher is not None and toucher[2] == "UNKNOWN" and not self.allow_unknown:
+            gap = t_sec - a.last_unknown_contact if a.last_unknown_contact is not None else None
+            if a.unknown_contact_since is None or gap is None or gap > self.contact_grace:
+                a.unknown_contact_since = t_sec
+            a.last_unknown_contact = t_sec
+            if t_sec - a.unknown_contact_since >= self.stay_limit and not a.interaction_alerted:
+                a.interaction_alerted = True
+                return AssetEvent(a, toucher[0], "unknown_interaction")
+        elif a.last_unknown_contact is not None and t_sec - a.last_unknown_contact > self.contact_grace:
+            a.unknown_contact_since = a.last_unknown_contact = None
+            a.interaction_alerted = False
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

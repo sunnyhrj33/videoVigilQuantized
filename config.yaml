@@ -83,22 +83,63 @@ security_zones:
   per_camera:
     camera_4:                  # desk with the monitored laptop (Demo 3, from make_demo_clips.py)
       restricted_desk_area: [[0.26, 0.287], [0.723, 0.287], [0.723, 0.97], [0.26, 0.97]]
-  monitored_assets:
-    - class_name: "laptop"
-      zone_stay_limit_seconds: 5
-      allow_unknown_interaction: false
-    - class_name: "backpack"
-      zone_stay_limit_seconds: 5
-      allow_unknown_interaction: false
-    - class_name: "handbag"
-      zone_stay_limit_seconds: 5
-      allow_unknown_interaction: false
 
-assets:
-  overlap_thresh: 0.30         # Area(person ∩ asset) / Area(asset) to count as contact
-  move_thresh: 0.35            # Asset centre shift (× its box diagonal) to count as moved
-  anchor_frames: 15            # Frames an asset must be seen before it is "registered"
-  max_missing_frames: 90       # Forget an asset not seen for this many frames
+# ── Asset Monitoring (static anchor + displacement) ─────
+# Home anchors come from monitored_zones (per camera, pixel boxes), from boxes drawn in
+# the console (saved to output/asset_anchors.json), or are auto-registered when a
+# detected asset stays still for anchor_frames.
+asset_monitoring:
+  enabled: true
+  target_asset_classes: [63, 24, 26]   # COCO 63 = laptop, 24 = backpack, 26 = handbag
+  displacement_threshold_px: 35        # Δd = ‖centre − home centre‖ beyond this = moved
+  interaction_iou_thresh: 0.25         # Area(person ∩ asset) / Area(asset) = contact
+  confirm_frames: 5                    # Δd must exceed the threshold this many frames in a row
+  anchor_frames: 15                    # still frames before an auto-detected asset is anchored
+  abandon_frames: 45                   # handler away this long → ABANDONED at (x, y)
+  missing_frames: 90                   # asset unseen this long → MISSING
+  unknown_stay_limit_seconds: 5        # unknown person at an asset this long → alert
+  allow_unknown_interaction: false
+  monitored_zones: {}                  # e.g. camera_4: {desk_laptop_1: [540, 280, 680, 410]}
+
+# ── Suspect Tracking (auto-enrolment) ─────────
+suspect_tracking:
+  auto_enrol_unknown_movers: true      # unauthorised displacement → SUSPECT_xx profile
+  auto_enrol_on_interaction: true      # also enrol unknowns lingering at an asset (> stay limit)
+  crops_to_sample: 8                   # tracklet crops pooled into the suspect prototype
+  match_threshold: 0.75                # tracklet-centroid cosine for "SUSPECT (RE-ID MATCH)"
+                                       # (CHIRLA calibration: ≈6% false matches at 0.75)
+  pending_timeout_seconds: 6           # displacement by a still-PENDING person → decide as UNKNOWN
+  gallery_dir: output/suspects
+  audit_log_path: output/theft_audit_log.csv
+  history_log: output/track_history.csv
+  history_interval_frames: 30          # one track-history row per track per second
+
+# ── Video-wide Search ─────────────────────────
+video_search:
+  index_dir: output/index
+  detector: yolo11n_int8_480
+  stride_frames: 15                    # index 2 frames / second
+  min_person_conf: 0.5
+  min_height: 64
+  min_similarity: 0.6                  # results below this are never shown
+  top_k: 30
+  exclude_employees: true              # drop tracklets recognised as enrolled employees
+
+# ── Web dashboard (python web_app.py) ─────────
+# Simplified upload-and-analyse front end. Its users get fixed settings (no model,
+# tracker or threshold controls); everything it writes stays under data_dir, so the
+# console's logs and suspect gallery are never touched.
+web:
+  host: 127.0.0.1
+  port: 8000
+  data_dir: output/web                 # uploads, results, known people, suspects, logs
+  detector: yolo11n_int8_480
+  analysis_fps: 15                     # frames analysed per second of video (lower = faster)
+  output_width: 1280                   # annotated video is scaled down to at most this width
+  max_upload_mb: 2048
+  min_person_seconds: 1.0              # people on screen for less than this are dropped (noise)
+  same_person_threshold: 0.75          # track-centroid cosine to merge two tracks into one person
+  thumbs_per_person: 6
 
 # ── CHIRLA protocol ───────────────────────────
 chirla:

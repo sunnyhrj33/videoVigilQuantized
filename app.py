@@ -21,7 +21,6 @@ import csv
 import json
 import logging
 import os
-import platform
 import queue
 import re
 import subprocess
@@ -37,6 +36,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from console_tabs import INDEX_RE, SearchTab, SuspectsTab
 from detection_engine import DetectionEngine
 from system_utils import get_available_trackers, recommend_models
 
@@ -44,24 +44,8 @@ CONFIG_PATH = "config.yaml"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEMO_MANIFEST = Path("output/demo/demo_clips.json")
 
-IS_WIN = platform.system() == "Windows"
-FONT = "Segoe UI" if IS_WIN else "DejaVu Sans"
-MONO = "Consolas" if IS_WIN else "DejaVu Sans Mono"
-
-# ── Colour palette (dark theme) ───────────────────────────────────────────────
-BG = "#0b0e14"
-PANEL = "#121722"
-CARD = "#19202e"
-CARD2 = "#202839"
-BORDER = "#283247"
-FG = "#e6eaf0"
-FG_DIM = "#7d889c"
-ACCENT = "#00e5a0"      # known / OK
-ACCENT2 = "#3b9eff"     # info / actions
-WARN = "#ff9f1c"        # unknown
-DANGER = "#ff4d6d"      # alerts
-CYAN = "#22d3ee"        # assets
-PURPLE = "#a78bfa"      # pipeline
+from ui_theme import (ACCENT, ACCENT2, BG, BORDER, CARD, CARD2, CYAN, DANGER, FG, FG_DIM,  # noqa: E402
+                      FONT, IS_WIN, MONO, PANEL, PURPLE, WARN, ScrollFrame)
 
 REID_MODELS = ["osnet_ain_x1_0", "osnet_x1_0", "osnet_x0_25", "resnet50", "resnet101",
                "fastraid", "osnet_ibn", "transreid", "vitreid"]
@@ -79,6 +63,10 @@ PIPELINE_STEPS = [
              "days vs the naive baseline."},
     {"key": "clips", "title": "Build demo clips", "script": "make_demo_clips.py",
      "desc": "Find & export the 3 evaluation clips (persistence, rejection, asset)."},
+    {"key": "index", "title": "Index CCTV for search", "script": "video_search.py",
+     "args": ["index", "--day", "2023-06-08", "--day", "2023-07-26"],
+     "desc": "Video-wide search index of the demo days: person tracklets + OSNet embeddings "
+             "(≈15 min per day)."},
 ]
 PIPE_NOISE = re.compile(r"Cython|warnings\.warn|params:|flops:|^Model:|discarded|"
                         r"Successfully loaded|^\s*$")
@@ -111,9 +99,10 @@ class VideoWorker(threading.Thread):
     """Reads frames, runs the engine, pushes results to a queue for the GUI."""
 
     def __init__(self, source, engine: DetectionEngine, out_q: queue.Queue, target_fps: int = 30,
-                 realtime: bool = False):
+                 realtime: bool = False, start_frame: int = 0):
         super().__init__(daemon=True)
         self.source = source
+        self.start_frame = int(start_frame)
         self.engine = engine
         self.out_q = out_q
         self.target_fps = target_fps
@@ -133,7 +122,9 @@ class VideoWorker(threading.Thread):
 
         frame_delay = 1.0 / self.target_fps if self.target_fps > 0 else 0.0
         src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.engine.set_source(self.source, src_fps)
+        if self.start_frame and isinstance(self.source, str):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        self.engine.set_source(self.source, src_fps, self.start_frame)
         is_file = isinstance(self.source, str)
         t_start, frame_no = time.perf_counter(), 0
 
@@ -169,28 +160,6 @@ class VideoWorker(threading.Thread):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Small widgets
 # ─────────────────────────────────────────────────────────────────────────────
-
-class ScrollFrame(tk.Frame):
-    """Vertically scrollable frame (mouse wheel while hovered)."""
-
-    def __init__(self, parent, bg=PANEL, **kw):
-        super().__init__(parent, bg=bg, **kw)
-        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
-        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview,
-                                 style="Dark.Vertical.TScrollbar")
-        self.inner = tk.Frame(self.canvas, bg=bg)
-        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.vsb.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.vsb.pack(side="right", fill="y")
-        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._win, width=e.width))
-        self.bind("<Enter>", lambda e: self.bind_all("<MouseWheel>", self._wheel))
-        self.bind("<Leave>", lambda e: self.unbind_all("<MouseWheel>"))
-
-    def _wheel(self, e):
-        self.canvas.yview_scroll(int(-e.delta / 120), "units")
-
 
 class StatTile(tk.Frame):
     def __init__(self, parent, caption, colour):
@@ -303,7 +272,14 @@ class App(tk.Tk):
 
         self.nb = ttk.Notebook(body)
         self.nb.grid(row=0, column=1, sticky="nsew", padx=(0, 6), pady=(4, 0))
+        self._tabs = {}
         self._build_live_tab()
+        self.suspects_tab = SuspectsTab(self.nb, self)
+        self.nb.add(self.suspects_tab, text="  🕵  Suspects  ")
+        self._tabs["suspects"] = self.suspects_tab
+        self.search_tab = SearchTab(self.nb, self)
+        self.nb.add(self.search_tab, text="  🔎  Video Search  ")
+        self._tabs["search"] = self.search_tab
         self._build_pipeline_tab()
         self._build_gallery_tab()
         self._build_eval_tab()
@@ -448,6 +424,23 @@ class App(tk.Tk):
                            activebackground=PANEL, activeforeground=ACCENT, font=(FONT, 9),
                            cursor="hand2", command=cmd).grid(row=i // 2, column=i % 2, sticky="w", padx=2)
 
+        # Assets (static anchors)
+        self._section(sb, "ASSET MONITORING")
+        self._assets_var = tk.BooleanVar(value=self.engine._assets.enabled)
+        tk.Checkbutton(sb, text="Monitor laptops / bags (displacement → theft alert)", variable=self._assets_var,
+                       bg=PANEL, fg=FG, selectcolor=CARD, activebackground=PANEL, activeforeground=ACCENT,
+                       font=(FONT, 9), cursor="hand2",
+                       command=lambda: setattr(self.engine._assets, "enabled", self._assets_var.get())
+                       ).pack(anchor="w", padx=12)
+        arow = tk.Frame(sb, bg=PANEL)
+        arow.pack(fill="x", padx=16, pady=(4, 0))
+        self._draw_btn = self._button(arow, "✏  Draw laptop anchor", self._begin_anchor, CARD2, fg=FG)
+        self._draw_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self._button(arow, "Clear", self._clear_anchors, CARD2, fg=FG).pack(side="left")
+        tk.Label(sb, text="Laptops that stay still are anchored automatically; draw a box to fix an "
+                          "anchor yourself.", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
+                 wraplength=250, anchor="w").pack(fill="x", padx=16, pady=(2, 0))
+
         # Controls
         ctrl = tk.Frame(sb, bg=PANEL)
         ctrl.pack(fill="x", padx=16, pady=(16, 16))
@@ -485,12 +478,17 @@ class App(tk.Tk):
     def _build_live_tab(self):
         tab = tk.Frame(self.nb, bg=BG)
         self.nb.add(tab, text="  ◉  Live Monitor  ")
+        self._tabs["live"] = tab
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
 
         self.canvas = tk.Canvas(tab, bg="#05070b", bd=0, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew", padx=(6, 6), pady=6)
         self.canvas.bind("<Configure>", lambda e: (not self._running) and self._draw_placeholder())
+        self.canvas.bind("<ButtonPress-1>", self._canvas_press)
+        self.canvas.bind("<B1-Motion>", self._canvas_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
+        self._drawing, self._drag, self._disp, self._preview = False, None, None, None
 
         side = tk.Frame(tab, bg=BG, width=310)
         side.grid(row=0, column=1, sticky="ns", pady=6, padx=(0, 6))
@@ -499,12 +497,16 @@ class App(tk.Tk):
         side.rowconfigure(5, weight=1)
 
         self._tiles = {}
+        tiles = tk.Frame(side, bg=BG)
+        tiles.grid(row=0, column=0, columnspan=2, rowspan=2, sticky="ew")
+        tiles.columnconfigure((0, 1, 2), weight=1)
         for i, (key, cap, col) in enumerate([("fps", "FPS", ACCENT2), ("known", "KNOWN", ACCENT),
-                                             ("unknown", "UNKNOWN", WARN), ("alerts", "ALERTS", DANGER)]):
-            t = StatTile(side, cap, col)
-            t.grid(row=i // 2, column=i % 2, sticky="ew", padx=(0 if i % 2 == 0 else 3, 0 if i % 2 else 3),
-                   pady=(0, 6))
+                                             ("unknown", "UNKNOWN", WARN), ("alerts", "ALERTS", DANGER),
+                                             ("suspects", "SUSPECTS", DANGER), ("tracks", "TRACKS", FG_DIM)]):
+            t = StatTile(tiles, cap, col)
+            t.grid(row=i // 3, column=i % 3, sticky="ew", padx=2, pady=(0, 4))
             self._tiles[key] = t
+        self._tiles["suspects"].set(len(self.engine.suspects))
 
         self._cam_label = tk.Label(side, text="No source", bg=CARD, fg=FG, font=(FONT, 9),
                                    anchor="w", padx=10, pady=6)
@@ -517,18 +519,28 @@ class App(tk.Tk):
         for c, w, t in zip(cols, (40, 100, 70, 90), ("ID", "IDENTITY", "P(KNOWN)", "STATUS")):
             self._people.heading(c, text=t)
             self._people.column(c, width=w, anchor="w", stretch=c == "who")
-        for tag, col in (("KNOWN", ACCENT), ("UNKNOWN", WARN), ("PENDING", FG_DIM), ("INTRUSION", DANGER)):
+        for tag, col in (("KNOWN", ACCENT), ("UNKNOWN", WARN), ("PENDING", FG_DIM), ("INTRUSION", DANGER),
+                         ("SUSPECT", DANGER)):
             self._people.tag_configure(tag, foreground=col)
-        self._people.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 8))
+        self._people.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 2))
+        acts = tk.Frame(side, bg=BG)
+        acts.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        acts.columnconfigure((0, 1), weight=1)
+        self._button(acts, "🚩 Flag suspect", self._flag_selected, CARD2, fg=FG).grid(
+            row=0, column=0, sticky="ew", padx=(0, 2))
+        self._button(acts, "🔎 Search person", self._search_selected, CARD2, fg=FG).grid(
+            row=0, column=1, sticky="ew", padx=(2, 0))
 
+        side.rowconfigure(5, weight=0)
+        side.rowconfigure(6, weight=1)
         feed_hdr = tk.Frame(side, bg=BG)
-        feed_hdr.grid(row=5, column=0, columnspan=2, sticky="new")
+        feed_hdr.grid(row=6, column=0, columnspan=2, sticky="new")
         tk.Label(feed_hdr, text="ALERTS & EVENTS", bg=BG, fg=FG_DIM, font=(FONT, 8, "bold")).pack(side="left")
         self._feed = tk.Text(side, bg=CARD, fg=FG, font=(FONT, 9), bd=0, wrap="word",
                              highlightthickness=0, padx=8, pady=6, state="disabled")
-        self._feed.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(20, 0))
+        self._feed.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(20, 0))
         for tag, col in (("alert", DANGER), ("identity", ACCENT), ("asset", CYAN), ("info", ACCENT2),
-                         ("time", FG_DIM), ("unknown", WARN)):
+                         ("time", FG_DIM), ("unknown", WARN), ("suspect", DANGER)):
             self._feed.tag_configure(tag, foreground=col)
         self._feed.tag_configure("alert", font=(FONT, 9, "bold"))
 
@@ -537,6 +549,7 @@ class App(tk.Tk):
     def _build_pipeline_tab(self):
         tab = tk.Frame(self.nb, bg=BG)
         self.nb.add(tab, text="  ⚙  Pipeline  ")
+        self._tabs["pipeline"] = tab
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(2, weight=1)
 
@@ -591,6 +604,7 @@ class App(tk.Tk):
     def _build_gallery_tab(self):
         tab = tk.Frame(self.nb, bg=BG)
         self.nb.add(tab, text="  👥  Gallery  ")
+        self._tabs["gallery"] = tab
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
         top = tk.Frame(tab, bg=BG)
@@ -611,6 +625,7 @@ class App(tk.Tk):
     def _build_eval_tab(self):
         tab = tk.Frame(self.nb, bg=BG)
         self.nb.add(tab, text="  📊  Evaluation  ")
+        self._tabs["eval"] = tab
         self._eval_canvas = tk.Canvas(tab, bg=BG, highlightthickness=0)
         self._eval_canvas.pack(fill="both", expand=True, padx=6, pady=6)
         self._eval_canvas.bind("<Configure>", lambda e: self._render_eval())
@@ -620,6 +635,7 @@ class App(tk.Tk):
     def _build_audit_tab(self):
         tab = tk.Frame(self.nb, bg=BG)
         self.nb.add(tab, text="  🧾  Audit Log  ")
+        self._tabs["audit"] = tab
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
         top = tk.Frame(tab, bg=BG)
@@ -718,20 +734,41 @@ class App(tk.Tk):
         self._chip_reid.config(text=f"{self.engine._reid_model_name or '—'} · {backend}")
         self._chip_gallery.config(text=f"👥 {self.engine.gallery_info}")
 
+    TAB_ORDER = ["live", "suspects", "search", "pipeline", "gallery", "eval", "audit"]
+
+    def select_tab(self, name: str):
+        self.nb.select(self._tabs[name])
+
+    def current_tab(self) -> str:
+        cur = self.nb.select()
+        return next((k for k, t in self._tabs.items() if str(t) == cur), "")
+
     def _tick(self):
         self._clock.config(text=time.strftime("%H:%M:%S"))
-        if self.nb.index("current") == 4:
+        tab = self.current_tab()
+        if tab == "audit":
             self._refresh_audit()
+        sig = self.suspects_tab.signature()
+        if sig != getattr(self, "_suspect_sig", None):
+            self._suspect_sig = sig
+            self.search_tab.refresh_queries()
+            self._tiles["suspects"].set(len(self.engine.suspects))
+            if tab == "suspects":
+                self.suspects_tab.render()
         self.after(1000, self._tick)
 
     def _on_tab(self):
-        idx = self.nb.index("current")
-        if idx == 2:
+        tab = self.current_tab()
+        if tab == "gallery":
             self._load_gallery_days()
-        elif idx == 3:
+        elif tab == "eval":
             self._render_eval()
-        elif idx == 4:
+        elif tab == "audit":
             self._refresh_audit(force=True)
+        elif tab == "suspects":
+            self.suspects_tab.render()
+        elif tab == "search":
+            self.search_tab.refresh_days()
 
     def _draw_placeholder(self):
         c = self.canvas
@@ -856,7 +893,28 @@ class App(tk.Tk):
         except ValueError:
             return raw
 
-    def _start(self):
+    def play_from(self, path: str, frame: int = 0):
+        """Open a recording at a given frame in the Live Monitor (search results, suspect origin)."""
+        if self._running:
+            self._stop()
+        self._source_var.set(path)
+        self._start(start_frame=frame)
+
+    def find_video(self, name: str) -> Optional[Path]:
+        """Locate a recording by file name (demo clips, renders or the CHIRLA videos)."""
+        p = Path(name)
+        if p.exists():
+            return p
+        norm = name.replace("\uf03a", ":")
+        for root in (Path("output/demo"), Path("output/rendered"),
+                     Path(self.cfg.get("chirla", {}).get("root", "")) / "videos"):
+            if root.exists():
+                for f in root.rglob("*"):
+                    if f.name.replace("\uf03a", ":") == norm:
+                        return f
+        return None
+
+    def _start(self, start_frame: int = 0):
         if self.engine._model is None:
             messagebox.showwarning("No model", "Load the models first.")
             return
@@ -873,13 +931,13 @@ class App(tk.Tk):
         self._frame_q = queue.Queue(maxsize=5)
         self._worker = VideoWorker(source, self.engine, self._frame_q,
                                    self.cfg.get("video", {}).get("target_fps", 30),
-                                   realtime=self._realtime_var.get())
+                                   realtime=self._realtime_var.get(), start_frame=start_frame)
         self._worker.start()
         self._running = True
         self._clear_text(self._feed)
         self._start_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
-        self.nb.select(0)
+        self.select_tab("live")
         self._set_status(f"Running · {source}")
         self._poll_frames()
 
@@ -934,11 +992,102 @@ class App(tk.Tk):
         self.canvas.delete("all")
         self.canvas.create_image((cw - nw) // 2, (ch - nh) // 2, anchor="nw", image=img)
         self.canvas._img_ref = img
+        self._disp = ((cw - nw) // 2, (ch - nh) // 2, scale, w, h)
+        if self._drag is not None:
+            x0, y0, x1, y1 = self._drag
+            self.canvas.create_rectangle(x0, y0, x1, y1, outline=CYAN, width=2, dash=(6, 4))
+        elif self._drawing:
+            self.canvas.create_text(cw // 2, 24, text="Drag a box around the laptop on its desk",
+                                    fill=CYAN, font=(FONT, 12, "bold"))
+
+    # ── asset anchor drawing ──────────────────────────────────────────────────
+
+    def _begin_anchor(self):
+        """Next mouse drag on the video defines a laptop home anchor for this camera."""
+        if not self._running:
+            source = self._resolve_source()
+            cap = cv2.VideoCapture(source)
+            ok, frame = cap.read()
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            cap.release()
+            if not ok:
+                messagebox.showinfo("Draw anchor", "Pick a video source (or start playback) first.")
+                return
+            self.engine.set_source(source, fps)
+            self._preview = frame
+        self._drawing, self._drag = True, None
+        self._draw_btn.config(bg=CYAN, fg=BG)
+        self._set_status("Draw mode: drag a box around the laptop in the video")
+        if not self._running:
+            self._display_frame(self._preview)
+
+    def _canvas_press(self, e):
+        if self._drawing:
+            self._drag = [e.x, e.y, e.x, e.y]
+
+    def _canvas_motion(self, e):
+        if self._drawing and self._drag is not None:
+            self._drag[2:] = [e.x, e.y]
+            if not self._running and self._preview is not None:
+                self._display_frame(self._preview)
+
+    def _canvas_release(self, e):
+        if not self._drawing or self._drag is None or self._disp is None:
+            return
+        ox, oy, scale, w, h = self._disp
+        x0, y0, x1, y1 = self._drag
+        box = [int((min(x0, x1) - ox) / scale), int((min(y0, y1) - oy) / scale),
+               int((max(x0, x1) - ox) / scale), int((max(y0, y1) - oy) / scale)]
+        box = [max(0, min(w, box[0])), max(0, min(h, box[1])), max(0, min(w, box[2])), max(0, min(h, box[3]))]
+        self._drawing, self._drag = False, None
+        self._draw_btn.config(bg=CARD2, fg=FG)
+        if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+            self._set_status("Anchor too small – try again")
+            return
+        name = self.engine.add_asset_anchor(box)
+        self._set_status(f"✓ Anchor '{name}' saved for {self.engine._cam_key} at {box}")
+        if not self._running and self._preview is not None:
+            self._display_frame(self._preview)
+
+    def _clear_anchors(self):
+        self.engine.clear_asset_anchors()
+        self._set_status(f"Drawn anchors cleared for {self.engine._cam_key or 'this camera'}")
+
+    # ── people actions ────────────────────────────────────────────────────────
+
+    def _selected_tid(self) -> Optional[int]:
+        sel = self._people.selection()
+        if not sel:
+            messagebox.showinfo("Select a person", "Select a person in the PEOPLE IN VIEW table first.")
+            return None
+        return int(str(self._people.item(sel[0], "values")[0]).lstrip("T"))
+
+    def _flag_selected(self):
+        tid = self._selected_tid()
+        if tid is None:
+            return
+        s = self.engine.flag_suspect(tid)
+        if s is None:
+            messagebox.showinfo("Flag suspect", f"T{tid} has no sharp crops yet – try again in a moment.")
+            return
+        self._set_status(f"🚩 T{tid} flagged as {s.label}")
+        self.suspects_tab.render(force=True)
+
+    def _search_selected(self):
+        tid = self._selected_tid()
+        if tid is None:
+            return
+        embs, thumbs = self.engine.track_embeddings(tid)
+        if len(embs) == 0:
+            messagebox.showinfo("Search person", f"T{tid} has no sharp crops yet – try again in a moment.")
+            return
+        self.search_tab.query_live(tid, embs, thumbs, self.engine._camera_id)
 
     def _update_stats(self, stats: dict):
         self._tiles["fps"].set(f"{stats.get('fps', 0):.1f}")
         for k in ("known", "unknown", "alerts"):
             self._tiles[k].set(stats.get(k, "—"))
+        self._tiles["tracks"].set(stats.get("tracks", "—"))
         if stats.get("camera"):
             assets = ", ".join(f"{n}: {s}" for n, s in stats.get("assets", [])) or "no assets in view"
             self._cam_label.config(text=f"📹 {stats['camera']}   🕒 {stats.get('time', '')}   ·   {assets}")
@@ -947,15 +1096,21 @@ class App(tk.Tk):
         if now - self._last_people_update < 0.25:
             return
         self._last_people_update = now
+        sel = self._people.selection()
+        self._keep_sel = int(str(self._people.item(sel[0], "values")[0]).lstrip("T")) if sel else None
         self._people.delete(*self._people.get_children())
         for p in sorted(stats.get("people", []), key=lambda p: p["tid"]):
             status = p["status"]
             tag = "INTRUSION" if p["intrusion"] else status
             shown = "PENDING" if status == "PENDING" else status
+            if p.get("carrying"):
+                shown += " 💼"
             if p["zone"]:
                 shown += " ⚠" if p["intrusion"] else " ·zone"
             pk = f"{p['confidence']:.2f}" if status != "PENDING" else f"{p['crops']} crops"
-            self._people.insert("", "end", values=(f"T{p['tid']}", p["name"], pk, shown), tags=(tag,))
+            iid = self._people.insert("", "end", values=(f"T{p['tid']}", p["name"], pk, shown), tags=(tag,))
+            if p["tid"] == self._keep_sel:
+                self._people.selection_set(iid)
 
     def _drain_events(self):
         for no, level, stamp, cam, text in self.engine.events_since(self._last_event):
@@ -966,7 +1121,7 @@ class App(tk.Tk):
                 tag = "unknown"
             else:
                 tag = level
-            icon = {"alert": "🚨 ", "identity": "👤 ", "asset": "💼 ", "info": "ℹ "}.get(level, "")
+            icon = {"alert": "🚨 ", "identity": "👤 ", "asset": "💼 ", "info": "ℹ ", "suspect": "🕵 "}.get(level, "")
             self._append(self._feed, [(f"{stamp} {cam}\n", "time"), (f"{icon}{text}\n\n", tag)],
                          max_lines=400, top=True)
 
@@ -1003,6 +1158,7 @@ class App(tk.Tk):
             "gallery": Path(reid["gallery_file"]),
             "train": Path(reid["open_set_model"]),
             "clips": DEMO_MANIFEST,
+            "index": Path(self.cfg.get("video_search", {}).get("index_dir", "output/index")),
         }
         for key, st in self._steps.items():
             p = checks[key]
@@ -1024,7 +1180,7 @@ class App(tk.Tk):
         if self._running:
             self._stop()
         self._pipe_queue = list(keys)
-        self.nb.select(1)
+        self.select_tab("pipeline")
         self._clear_text(self._console)
         self._set_pipeline_buttons("disabled")
         self._next_step()
@@ -1045,12 +1201,14 @@ class App(tk.Tk):
         st["prog"].config(mode="indeterminate")
         st["prog"].start(12)
         st["t0"] = time.time()
-        self._append(self._console, [(f"\n━━━ {st['title']}  ·  python {st['script']} ━━━\n", "head")])
+        args = st.get("args", [])
+        self._append(self._console, [(f"\n━━━ {st['title']}  ·  python {st['script']} {' '.join(args)} ━━━\n",
+                                      "head")])
         logger.info("Pipeline step started: %s", st["title"])
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
         flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
         self._pipe_proc = subprocess.Popen(
-            [sys.executable, "-u", st["script"]], cwd=PROJECT_DIR, env=env,
+            [sys.executable, "-u", st["script"], *args], cwd=PROJECT_DIR, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace", creationflags=flags)
         threading.Thread(target=self._read_pipe, args=(key, self._pipe_proc), daemon=True).start()
@@ -1065,6 +1223,15 @@ class App(tk.Tk):
         if PIPE_NOISE.search(line):
             return
         st = self._steps[key]
+        mi = INDEX_RE.search(line)
+        if mi:
+            k, n, f, total = (int(x) for x in mi.groups())
+            if str(st["prog"].cget("mode")) != "determinate":
+                st["prog"].stop()
+                st["prog"].config(mode="determinate")
+            st["prog"]["value"] = 100 * ((k - 1) + f / max(total, 1)) / n
+            st["status"].config(text=f"⟳ video {k}/{n} · frame {f:,}/{total:,}", fg=PURPLE)
+            return
         m = PROGRESS_RE.search(line)
         if m:
             done, total = int(m.group(1)), int(m.group(2))
@@ -1106,6 +1273,8 @@ class App(tk.Tk):
             self._refresh_chips()
         if key == "clips":
             self._reload_demo_clips()
+        if key == "index":
+            self.search_tab.refresh_days()
 
     # ── Gallery rendering ─────────────────────────────────────────────────────
 
@@ -1183,6 +1352,17 @@ class App(tk.Tk):
         days = ", ".join(m.get("test_days", []))
         c.create_text(16, 42, anchor="w", fill=FG_DIM, font=(FONT, 9),
                       text=f"Test days {days} · visitors never seen in training · same-day enrollment")
+        try:
+            se = json.loads(Path("output/search_eval.json").read_text())
+            ex = se.get("exclude_employees") or se.get("plain")
+            c.create_text(W - 16, 18, anchor="e", fill=CYAN, font=(FONT, 10, "bold"),
+                          text=f"Video-wide search ({ex['queries']} visitor queries, CHIRLA GT): "
+                               f"top-1 {ex['rank1']:.0%} · top-5 {ex['top5']:.0%} · mAP {ex['mAP']:.0%}")
+            c.create_text(W - 16, 42, anchor="e", fill=FG_DIM, font=(FONT, 9),
+                          text=f"days {', '.join(se.get('days', []))} · employees excluded · "
+                               f"python video_search.py eval")
+        except Exception:
+            pass
 
         methods = [("Naive\nclosed-set", m.get("naive_closed_set"), "#5b6577"),
                    (f"Naive\ncos ≥ {m.get('naive_thresh_value', 0.45)}", m.get("naive_threshold"), "#7b8599"),
@@ -1292,7 +1472,9 @@ def _parse_args():
     ap.add_argument("--source", help="video file / camera index to preselect")
     ap.add_argument("--mode", choices=[m for m, _ in MODES], help="identity mode")
     ap.add_argument("--start", action="store_true", help="start playback once models are loaded")
-    ap.add_argument("--tab", type=int, default=0, help="tab to open (0 live … 4 audit)")
+    ap.add_argument("--search", metavar="SUSPECT_ID", help="open Video Search for a suspect, e.g. SUSPECT_01")
+    ap.add_argument("--tab", type=int, default=0,
+                    help="tab to open: 0 live, 1 suspects, 2 search, 3 pipeline, 4 gallery, 5 eval, 6 audit")
     return ap.parse_args()
 
 
@@ -1307,9 +1489,11 @@ def _apply_args(app: "App", args):
     if args.source:
         app._source_var.set(args.source)
     if args.tab:
-        app.nb.select(args.tab)
+        app.select_tab(App.TAB_ORDER[args.tab] if args.tab < len(App.TAB_ORDER) else "live")
     if args.start:
         app._start()
+    if args.search:
+        app.search_tab.query_suspect(args.search)
 
 
 if __name__ == "__main__":

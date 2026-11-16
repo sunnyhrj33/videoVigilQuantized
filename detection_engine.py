@@ -11,6 +11,7 @@ Supports:
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
@@ -26,8 +27,11 @@ import yaml
 from chirla import camera_key, day_gallery_path, parse_video_name, source_date
 from official_trackers import OCSORTOfficial, StrongSORTOfficial, TrackFormerOfficial
 from open_set import (STATUS_KNOWN, STATUS_PENDING, STATUS_UNKNOWN, Identity,
-                      OpenSetClassifier, PrototypeGallery, TrackletManager, display_name)
-from security import AssetMonitor, AuditLogger, Clock, ZoneMonitor, zone_name_pretty
+                      OpenSetClassifier, PrototypeGallery, TrackletManager, display_name, l2n,
+                      tracklet_features)
+from security import (ABANDONED, IN_TRANSIT, MISSING, AssetMonitor, AuditLogger, Clock,
+                      ZoneMonitor, centre, zone_name_pretty)
+from suspects import SuspectGallery, TrackHistory
 
 # BGR colours for the security overlay
 COL_KNOWN = (60, 200, 60)
@@ -430,6 +434,8 @@ class DetectionEngine:
         self._identity_mode = reid_cfg.get("mode", "tracklet")
         self._tracklets: Optional[TrackletManager] = None
         self.gallery_info = "—"
+        # Extra identities merged into every source's enrolled gallery (web dashboard's known people)
+        self.extra_gallery: Optional[PrototypeGallery] = None
         self._zones = ZoneMonitor(cfg)
         self._zones.configure(None)
         self._assets = AssetMonitor(cfg)
@@ -444,6 +450,25 @@ class DetectionEngine:
         # UI event feed: (seq_no, level, stamp, camera, text); read via events_since()
         self._events: deque = deque(maxlen=500)
         self._event_no = 0
+        # Suspect tracking (auto-enrolled suspect gallery, track history, theft log)
+        self._st = cfg.get("suspect_tracking", {}) or {}
+        self.suspects = SuspectGallery(self._st.get("gallery_dir", "output/suspects"),
+                                       self._st.get("match_threshold", 0.75))
+        self._history = TrackHistory(self._st.get("history_log", "output/track_history.csv"),
+                                     self._st.get("history_interval_frames", 30))
+        self._theft: Optional[AuditLogger] = None
+        self._theft_path = self._st.get("audit_log_path", "output/theft_audit_log.csv")
+        self._suspect_of: Dict[int, str] = {}        # track id → suspect id (current source)
+        self._suspect_reid: Dict[int, bool] = {}     # matched by Re-ID (vs enrolled here)
+        self._suspect_checked: Dict[int, int] = {}
+        self._suspect_weak: Dict[int, int] = {}
+        self._suspect_cleared: set = set()
+        self._pending_disp: Dict[int, tuple] = {}
+        self._idents: Dict[int, Identity] = {}
+        self._anchors_path = Path(cfg.get("output", {}).get("output_dir", "output/")) / "asset_anchors.json"
+        self._cam_key: Optional[str] = None
+        self._source_name = ""
+        self._frame_size = (0, 0)
 
         # Re-ID
         self._reid_enabled = reid_cfg.get("enabled", True)
@@ -548,15 +573,29 @@ class DetectionEngine:
         if self._tracklets is not None:
             self._tracklets.p_thresh = float(p)
 
-    def set_source(self, source, fps: float = 30.0):
-        """Bind a new video source: camera ID, clock, per-camera zones; reset all state."""
+    def set_source(self, source, fps: float = 30.0, start_frame: int = 0):
+        """Bind a new video source: camera ID, clock, per-camera zones / anchors; reset state.
+        The suspect gallery is kept, so suspects can be re-identified in other cameras."""
         with self._engine_lock:
             cam, start = parse_video_name(str(source)) if isinstance(source, str) else (None, None)
+            fps = fps if fps and fps > 1 else 30.0
+            if start is not None and start_frame:
+                from datetime import timedelta
+                start = start + timedelta(seconds=start_frame / fps)
             self._camera_id = cam or ("Webcam" if not isinstance(source, str) else "Cam_00")
-            self._clock = Clock(start=start, fps=fps if fps and fps > 1 else 30.0)
-            self._zones.configure(camera_key(str(source)))
+            self._clock = Clock(start=start, fps=fps)
+            self._cam_key = camera_key(str(source)) if isinstance(source, str) else "webcam"
+            self._source_name = Path(str(source)).name if isinstance(source, str) else str(source)
+            self._zones.configure(self._cam_key)
             self._frame_idx = 0
-            self._assets.reset()
+            self._assets.configure(self._cam_key, self._load_anchors().get(self._cam_key or "webcam", {}))
+            self._history.reset()
+            self._suspect_of.clear()
+            self._suspect_reid.clear()
+            self._suspect_checked.clear()
+            self._suspect_weak.clear()
+            self._suspect_cleared.clear()
+            self._pending_disp.clear()
             if self._tracklets is not None:
                 self._tracklets.set_gallery(self._gallery_for(source))
             self._logged_identity.clear()
@@ -578,6 +617,8 @@ class DetectionEngine:
             logger.warning("No gallery enrolled for %s – using default %s", date, default)
             path = default
         gallery = PrototypeGallery.load(path)
+        if self.extra_gallery is not None:
+            gallery = gallery.merged(self.extra_gallery)
         self.gallery_info = f"{gallery.meta.get('date', 'default')} · {len(gallery)} enrolled"
         return gallery
 
@@ -592,9 +633,11 @@ class DetectionEngine:
             self._initialize_tracker()
 
     def close(self):
-        if self._audit is not None:
-            self._audit.close()
-            self._audit = None
+        for log in (self._audit, self._theft):
+            if log is not None:
+                log.close()
+        self._audit = self._theft = None
+        self._history.close()
 
     def set_tracker(self, tracker_name: str):
         """
@@ -931,18 +974,21 @@ class DetectionEngine:
 
             return annotated, stats
 
-    # ── Security layer (identity · zones · assets · audit) ─────────────────────
+    # ── Security layer (identity · zones · assets · suspects · audit) ─────────
 
     def _annotate_security(self, frame: np.ndarray, annotated: np.ndarray,
                            dets: list, names: Dict[int, str], stats: dict):
         h, w = frame.shape[:2]
+        self._frame_size = (w, h)
         self._clock.set_frame(self._frame_idx)
         t_sec = self._clock.seconds
 
         persons = [d for d in dets if d[2] == PERSON_CLASS and d[3] >= 0 and d[1] >= self.person_conf]
         objects = [(names.get(d[2], str(d[2])), d[0]) for d in dets if d[2] != PERSON_CLASS]
+        self._tracklets.watch = set(self._suspect_of)
         idents = self._tracklets.update(frame, self._frame_idx,
                                         [(tid, box, conf) for box, conf, _, tid in persons])
+        self._idents = idents
 
         polys = self._zones.pixel_polygons(w, h) if self.zones_enabled else {}
         for name, poly in polys.items():
@@ -950,7 +996,20 @@ class DetectionEngine:
             x, y = poly[:, 0].min(), poly[:, 1].min()
             self._draw_label(annotated, zone_name_pretty(name).replace("_", " "), (x, y), COL_ZONE, (0, 0, 0))
 
-        person_info, person_zone, people = [], {}, []
+        # Suspect re-identification (tracks that are not confidently enrolled employees)
+        if len(self.suspects):
+            for box, _, _, tid in persons:
+                self._check_suspect(tid, idents.get(tid, Identity()), t_sec)
+
+        # Assets first, so person labels can show who is carrying what
+        person_info = [(tid, box, idents.get(tid, Identity()).status, idents.get(tid, Identity()).label)
+                       for box, _, _, tid in persons]
+        for ev in self._assets.update(self._frame_idx, t_sec, objects, person_info):
+            self._on_asset_event(ev, idents, t_sec)
+        self._resolve_pending_displacements(idents, t_sec)
+        carrying = {a.handler: a for a in self._assets.assets if a.status == IN_TRANSIT and a.handler is not None}
+
+        person_zone, people = {}, []
         counts = {STATUS_KNOWN: 0, STATUS_UNKNOWN: 0, STATUS_PENDING: 0}
         for box, _, _, tid in persons:
             ident = idents.get(tid, Identity())
@@ -958,52 +1017,305 @@ class DetectionEngine:
             zones_in = self._zones.zones_containing(box, w, h) if polys else []
             person_zone[tid] = zones_in[0] if zones_in else None
             intrusion = ident.status == STATUS_UNKNOWN and bool(zones_in)
-            people.append({"tid": tid, "status": ident.status, "confidence": ident.confidence,
-                           "name": (display_name(ident.label) if ident.status == STATUS_KNOWN
-                                    else "UNKNOWN" if ident.status == STATUS_UNKNOWN else "Identifying…"),
-                           "crops": ident.n_crops, "zone": zone_name_pretty(zones_in[0]) if zones_in else "",
-                           "intrusion": intrusion})
+            sid = self._suspect_of.get(tid)
+            suspect = self.suspects.suspects.get(sid) if sid else None
 
             self._log_identity(tid, ident)
             if intrusion:
                 for z in zones_in:
                     self._zone_alert(tid, ident, z, t_sec)
+            self._history.update(self._frame_idx, self._clock.stamp(), self._camera_id, self._source_name,
+                                 (w, h), tid, box, sid or self._log_name(ident), ident.status)
 
-            colour = (COL_ALERT if intrusion else COL_KNOWN if ident.status == STATUS_KNOWN
-                      else COL_UNKNOWN if ident.status == STATUS_UNKNOWN else COL_PENDING)
-            self._draw_trail(annotated, tid, box, colour)
-            thick = self.box_thick + (1 if intrusion else 0)
-            cv2.rectangle(annotated, box[:2], box[2:], colour, thick)
-            self._draw_label(annotated, self._identity_text(tid, ident), box[:2], colour, (255, 255, 255))
-            person_info.append((tid, box, ident.status, ident.label))
-
-        for ev in self._assets.update(self._frame_idx, t_sec, objects, person_info):
-            ident = idents.get(ev.track_id, Identity())
-            zone = person_zone.get(ev.track_id)
-            name = ev.asset.class_name.capitalize()
-            tag = {"possession": f"{name}_Possession_{self._log_name(ident)}",
-                   "displaced_unknown": f"{name}_Displaced",
-                   "unknown_interaction": f"{name}_Unknown_Interaction"}[ev.kind]
-            self._audit_log(ev.track_id, ident, zone_name_pretty(zone) if zone else "None", tag)
-            if ev.kind != "possession":
-                self._raise_banner(ev.text, t_sec)
+            if suspect is not None:
+                colour = COL_ALERT
+                asset = carrying.get(tid)
+                state = f"CARRYING {asset.class_name.upper()}" if asset else "STATUS: UNARMED"
+                text = f"{suspect.label}{' (RE-ID MATCH)' if self._suspect_reid.get(tid) else ''} | {state}"
+                if self.show_tid:
+                    text += f" | T{tid}"
             else:
-                self._emit("asset", ev.text)
+                colour = (COL_ALERT if intrusion else COL_KNOWN if ident.status == STATUS_KNOWN
+                          else COL_UNKNOWN if ident.status == STATUS_UNKNOWN else COL_PENDING)
+                text = self._identity_text(tid, ident)
+                if tid in carrying:
+                    text += f" | CARRYING {carrying[tid].class_name.upper()}"
+            self._draw_trail(annotated, tid, box, colour)
+            cv2.rectangle(annotated, box[:2], box[2:], colour,
+                          self.box_thick + (1 if intrusion or suspect is not None else 0))
+            self._draw_label(annotated, text, box[:2], colour, (255, 255, 255))
 
-        for a in self._assets.assets:
-            if a.last_seen != self._frame_idx:
-                continue
-            col = COL_ALERT if a.state == "ALERT" else COL_ASSET
-            cv2.rectangle(annotated, a.box[:2], a.box[2:], col, self.box_thick)
-            state = "ALERT" if a.state == "ALERT" else a.state
-            self._draw_label(annotated, f"{a.class_name.capitalize()}: {state}", a.box[:2], col, (0, 0, 0))
+            people.append({"tid": tid, "box": box, "status": "SUSPECT" if suspect else ident.status,
+                           "confidence": ident.confidence,
+                           "name": (suspect.label if suspect else display_name(ident.label)
+                                    if ident.status == STATUS_KNOWN
+                                    else "UNKNOWN" if ident.status == STATUS_UNKNOWN else "Identifying…"),
+                           "crops": ident.n_crops, "zone": zone_name_pretty(zones_in[0]) if zones_in else "",
+                           "intrusion": intrusion, "carrying": tid in carrying})
 
+        self._draw_assets(annotated)
         self._draw_banners(annotated, t_sec)
         stats.update(known=counts[STATUS_KNOWN], unknown=counts[STATUS_UNKNOWN],
                      pending=counts[STATUS_PENDING], alerts=self._alert_count,
                      camera=self._camera_id, time=self._clock.stamp(), people=people,
-                     assets=[(a.class_name, a.state) for a in self._assets.assets
-                             if a.last_seen == self._frame_idx])
+                     suspects_in_view=sorted({self._suspect_of[p["tid"]] for p in people
+                                              if p["tid"] in self._suspect_of}),
+                     assets=[(a.name, self._asset_state_text(a)) for a in self._assets.assets
+                             if a.last_seen == self._frame_idx or a.status == MISSING])
+
+    # ── assets ───────────────────────────────────────────────────────────────
+
+    def _who(self, tid: Optional[int], ident: Identity) -> str:
+        if tid is None:
+            return "unknown person"
+        sid = self._suspect_of.get(tid)
+        if sid:
+            return self.suspects.suspects[sid].label
+        if ident.status == STATUS_KNOWN:
+            return display_name(ident.label)
+        return f"T{tid} (UNKNOWN)" if ident.status == STATUS_UNKNOWN else f"T{tid}"
+
+    def _on_asset_event(self, ev, idents: Dict[int, Identity], t_sec: float):
+        a, tid = ev.asset, ev.track_id
+        ident = idents.get(tid, Identity()) if tid is not None else Identity()
+        detail = f"{a.name} Δd={ev.dist:.0f}px"
+        if ev.kind == "displacement":
+            if tid in self._suspect_of or ident.status == STATUS_UNKNOWN:
+                self._unauthorized_displacement(a, tid, ident, ev.dist, t_sec)
+            elif ident.status == STATUS_KNOWN:
+                self._authorized_relocation(a, tid, ident, ev.dist)
+            else:
+                self._pending_disp[tid] = (a, self._frame_idx, ev.dist)
+                self._emit("asset", f"{a.name} displaced by T{tid} ({ev.dist:.0f}px) – identifying the mover…")
+        elif ev.kind == "abandoned":
+            x, y = (int(v) for v in centre(a.box))
+            self._emit("asset", f"{a.name} ABANDONED at ({x}, {y}) by {self._who(tid, ident)}")
+            self._theft_log(tid, ident, "ASSET_ABANDONED", f"{a.name} at ({x},{y})")
+        elif ev.kind == "missing":
+            who = self._who(tid, ident)
+            if (tid in self._suspect_of or ident.status != STATUS_KNOWN) and tid is not None:
+                self._raise_banner(f"CRITICAL: {a.name} MISSING – last with {who}", t_sec)
+            else:
+                self._emit("asset", f"{a.name} out of view – last with {who}")
+            self._theft_log(tid, ident, "ASSET_MISSING", detail)
+        elif ev.kind == "returned":
+            self._emit("asset", f"{a.name} back on its anchor (SECURED)")
+            self._theft_log(None, Identity(), "ASSET_SECURED", a.name)
+        elif ev.kind == "unknown_interaction":
+            limit = self._assets.stay_limit
+            self._raise_banner(f"Security Alert: Unknown Person at {a.class_name.capitalize()} > {limit:.0f}s", t_sec)
+            self._audit_log(tid, ident, "None", f"{a.class_name.capitalize()}_Unknown_Interaction")
+            self._theft_log(tid, ident, "UNAUTHORIZED_INTERACTION", a.name)
+            if self._st.get("auto_enrol_on_interaction", True) and tid not in self._suspect_of:
+                self._enrol_suspect(tid, "unknown_interaction")
+
+    def _authorized_relocation(self, a, tid, ident, dist):
+        who = display_name(ident.label)
+        self._emit("asset", f"Authorized Relocation of {a.name} by {who} ({dist:.0f}px)")
+        self._audit_log(tid, ident, "None", f"{a.class_name.capitalize()}_Authorized_Relocation")
+        self._theft_log(tid, ident, "AUTHORIZED_RELOCATION", f"{a.name} Δd={dist:.0f}px")
+
+    def _unauthorized_displacement(self, a, tid, ident, dist, t_sec, note=""):
+        self._raise_banner("CRITICAL: Unauthorized Asset Displacement", t_sec)
+        self._audit_log(tid, ident, "None", f"{a.class_name.capitalize()}_Displaced")
+        self._theft_log(tid, ident, "THEFT_ALERT", f"{a.name} Δd={dist:.0f}px{note}")
+        if self._st.get("auto_enrol_unknown_movers", True) and tid not in self._suspect_of:
+            self._enrol_suspect(tid, "displacement")
+
+    def _resolve_pending_displacements(self, idents, t_sec):
+        timeout = float(self._st.get("pending_timeout_seconds", 6)) * self._clock.fps
+        for tid, (a, f0, dist) in list(self._pending_disp.items()):
+            ident = idents.get(tid, Identity())
+            if ident.status == STATUS_KNOWN:
+                self._authorized_relocation(a, tid, ident, dist)
+            elif ident.status == STATUS_UNKNOWN:
+                self._unauthorized_displacement(a, tid, ident, dist, t_sec)
+            elif self._frame_idx - f0 > timeout:
+                self._unauthorized_displacement(a, tid, ident, dist, t_sec, " (mover not identified in time)")
+            else:
+                continue
+            del self._pending_disp[tid]
+
+    @staticmethod
+    def _asset_state_text(a) -> str:
+        if a.status == IN_TRANSIT:
+            return f"WITH T{a.handler}"
+        if a.status == ABANDONED:
+            x, y = (int(v) for v in centre(a.box))
+            return f"ABANDONED AT ({x}, {y})"
+        if a.status == MISSING:
+            return f"MISSING (last with T{a.handler})" if a.handler is not None else "MISSING"
+        return "SECURED"
+
+    def _draw_assets(self, img: np.ndarray):
+        for a in self._assets.assets:
+            label = a.class_name.upper()
+            if a.status in (IN_TRANSIT, ABANDONED, MISSING) or a.last_seen < 0:
+                hx1, hy1, hx2, hy2 = a.home       # home anchor, dashed
+                pts = np.array([[hx1, hy1], [hx2, hy1], [hx2, hy2], [hx1, hy2]], np.int32)
+                self._draw_dashed_poly(img, pts, COL_ALERT if a.status == MISSING else COL_PENDING, dash=8, thick=1)
+            if a.status == MISSING:
+                self._draw_label(img, f"{label}: {self._asset_state_text(a)}", a.home[:2], COL_ALERT, (255, 255, 255))
+                continue
+            if a.last_seen < 0:
+                self._draw_label(img, f"{a.name} anchor", a.home[:2], COL_PENDING, (0, 0, 0))
+                continue
+            if a.last_seen != self._frame_idx:
+                continue
+            if a.status == IN_TRANSIT:
+                sid = self._suspect_of.get(a.handler)
+                who = self.suspects.suspects[sid].label if sid else f"TRACK_ID {a.handler}"
+                col, text = COL_ASSET, f"{label}: WITH {who}"
+            elif a.status == ABANDONED:
+                col, text = COL_UNKNOWN, f"{label}: {self._asset_state_text(a)}"
+            else:
+                col, text = COL_KNOWN, f"{label}: SECURED"
+            cv2.rectangle(img, a.box[:2], a.box[2:], col, self.box_thick)
+            self._draw_label(img, text, (a.box[0], a.box[3] + 20), col, (0, 0, 0))
+
+    def add_asset_anchor(self, box, name: Optional[str] = None) -> str:
+        """Register a home anchor drawn in the console (pixel box) for the current camera."""
+        with self._engine_lock:
+            anchors = self._load_anchors()
+            cam = self._cam_key or "webcam"
+            mine = anchors.setdefault(cam, {})
+            name = name or f"desk_laptop_{len(mine) + 1}"
+            mine[name] = [int(v) for v in box]
+            self._save_anchors(anchors)
+            self._assets._add(tuple(mine[name]), "laptop", "drawn", name=name, seen=-1)
+            self._emit("asset", f"Anchor '{name}' registered on {cam} at {mine[name]}")
+            return name
+
+    def clear_asset_anchors(self):
+        with self._engine_lock:
+            anchors = self._load_anchors()
+            anchors.pop(self._cam_key or "webcam", None)
+            self._save_anchors(anchors)
+            self._assets.configure(self._cam_key)
+            self._emit("asset", f"Drawn anchors cleared for {self._cam_key or 'webcam'}")
+
+    def _load_anchors(self) -> dict:
+        try:
+            return json.loads(self._anchors_path.read_text())
+        except Exception:
+            return {}
+
+    def _save_anchors(self, anchors: dict):
+        self._anchors_path.parent.mkdir(parents=True, exist_ok=True)
+        self._anchors_path.write_text(json.dumps(anchors, indent=2))
+
+    # ── suspects ─────────────────────────────────────────────────────────────
+
+    def _enrol_suspect(self, tid: Optional[int], reason: str):
+        if tid is None or self._tracklets is None:
+            return None
+        embs, thumbs = self._tracklets.track_data(tid)
+        k = int(self._st.get("crops_to_sample", 8))
+        if len(embs) == 0:
+            self._emit("info", f"Cannot enrol T{tid} as suspect yet – no sharp crops collected")
+            return None
+        s = self.suspects.enrol(embs[-k:], thumbs[-k:], created=self._clock.stamp(), camera=self._camera_id,
+                                source=self._source_name, frame=self._frame_idx, reason=reason,
+                                entry=self._history.backtrack(tid))
+        if s is None:
+            return None
+        self._suspect_of[tid] = s.suspect_id
+        self._suspect_reid[tid] = False
+        e = s.entry
+        origin = f" · entered {e.get('side', '?')} at {e.get('time', '?')}" if e else ""
+        self._emit("suspect", f"{s.label} auto-enrolled ({reason}, {len(embs[-k:])} crops){origin}")
+        self._theft_log(tid, Identity(status=STATUS_UNKNOWN), "SUSPECT_ENROLLED", f"{s.suspect_id} ({reason})")
+        return s
+
+    def flag_suspect(self, tid: int):
+        """Operator marks a live track as a suspect."""
+        with self._engine_lock:
+            if tid in self._suspect_of:
+                return self.suspects.suspects.get(self._suspect_of[tid])
+            return self._enrol_suspect(tid, "manual")
+
+    def _verify_suspect(self, tid: int, ident: Identity):
+        """A suspect label follows a tracker ID, and trackers sometimes swap IDs between
+        people who cross. Keep checking the newest crops; withdraw the label if they stop
+        matching the suspect or the track turns out to be a confidently known employee."""
+        sid = self._suspect_of[tid]
+        embs, _ = self._tracklets.track_data(tid)
+        if self._suspect_checked.get(tid) == len(embs) and ident.status != STATUS_KNOWN:
+            return
+        self._suspect_checked[tid] = len(embs)
+        recent = embs[-3:]
+        sim = float(l2n(l2n(recent).mean(axis=0)) @ self.suspects.prototypes[sid]) if len(recent) else 1.0
+        # Judge the newest crops on their own: after an ID switch the buffer still holds
+        # mostly the suspect's crops, so the track-level decision lags behind.
+        employee = ident.status == STATUS_KNOWN and ident.confidence >= self._tracklets.p_thresh + 0.2
+        if not employee and len(recent) >= 3:
+            feats, win = tracklet_features(recent, self._tracklets.gallery)
+            if self._tracklets.classifier.p_known(feats) >= self._tracklets.p_thresh + 0.2:
+                employee = True
+                ident = Identity(status=STATUS_KNOWN, label=self._tracklets.gallery.labels[win])
+        weak = sim < float(self._st.get("verify_threshold", 0.6))
+        self._suspect_weak[tid] = self._suspect_weak.get(tid, 0) + 1 if weak else 0
+        if employee or self._suspect_weak[tid] >= 2:
+            label = self.suspects.suspects[sid].label
+            del self._suspect_of[tid]
+            self._suspect_reid.pop(tid, None)
+            self._suspect_weak.pop(tid, None)
+            self._suspect_cleared.add(tid)
+            why = f"now recognised as {display_name(ident.label)}" if employee else f"appearance changed (sim {sim:.2f})"
+            self._emit("suspect", f"{label} label withdrawn from T{tid} – {why} (tracker ID switch)")
+            self._theft_log(tid, ident, "SUSPECT_LABEL_WITHDRAWN", f"{sid}: {why}")
+
+    def _check_suspect(self, tid: int, ident: Identity, t_sec: float):
+        if self._tracklets is None:
+            return
+        if tid in self._suspect_of:
+            self._verify_suspect(tid, ident)
+            return
+        if tid in self._suspect_cleared:
+            return                                   # just withdrawn – don't flip straight back
+        if ident.status == STATUS_KNOWN and ident.confidence >= self._tracklets.p_thresh:
+            return                                   # confidently an enrolled employee
+        embs, _ = self._tracklets.track_data(tid)
+        if len(embs) < self._tracklets.min_crops or self._suspect_checked.get(tid) == len(embs):
+            return
+        self._suspect_checked[tid] = len(embs)
+        sid, sim = self.suspects.match(embs)
+        if sid is None:
+            return
+        s = self.suspects.suspects[sid]
+        self._suspect_of[tid] = sid
+        self._suspect_reid[tid] = True
+        self._raise_banner(f"{s.label} RE-IDENTIFIED on {self._camera_id} (sim {sim:.2f})", t_sec)
+        self._theft_log(tid, ident, "SUSPECT_REID", f"{sid} sim={sim:.2f}")
+        self.suspects.add_sighting(sid, time=self._clock.stamp(), camera=self._camera_id,
+                                   source=self._source_name, frame=self._frame_idx, track=tid,
+                                   sim=round(sim, 3))
+
+    def _theft_log(self, tid, ident: Identity, status: str, detail: str):
+        if self._theft is None:
+            self._theft = AuditLogger(self._theft_path)
+        who = self._suspect_of.get(tid) if tid is not None else None
+        self._theft.log(self._clock.stamp(), self._camera_id, tid if tid is not None else -1,
+                        who or self._log_name(ident), status, ident.confidence, "None", detail)
+
+    def track_embeddings(self, tid: int):
+        """Tracklet embeddings + thumbnails of a live track (for video-wide search)."""
+        if self._tracklets is None:
+            return np.zeros((0, 512), np.float32), []
+        return self._tracklets.track_data(tid)
+
+    def embed_image(self, bgr: np.ndarray) -> np.ndarray:
+        """Embed a person photo; if it is a full frame, the largest detected person is used."""
+        crop = bgr
+        if self._model is not None and bgr.shape[0] > 300:
+            with self._engine_lock:
+                r = self._model.predict(bgr, classes=[PERSON_CLASS], conf=0.4, verbose=False,
+                                        imgsz=self._model_imgsz or self.imgsz)[0]
+            if r.boxes is not None and len(r.boxes):
+                b = max(r.boxes.xyxy.cpu().numpy(), key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+                x1, y1, x2, y2 = (int(v) for v in b)
+                crop = bgr[max(0, y1):y2, max(0, x1):x2]
+        return self._reid_extractor.extract_batch([crop])
 
     def _identity_text(self, tid: int, ident: Identity) -> str:
         suffix = f" | T{tid}" if self.show_tid else ""
