@@ -10,11 +10,11 @@ from __future__ import annotations
 import pickle
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox
+from console.theme import dialogs as messagebox  # themed drop-in
 
 from PIL import Image, ImageTk
 
-from console.theme import (ACCENT, BG, BORDER, CARD, FG, FG_DIM, FONT,
+from console.theme import (FONT_SEMI, OK, ACCENT, BG, BORDER, CARD, FG, FG_DIM, FONT,
                            ScrollFrame, button, combo)
 from core.chirla import is_iso_date
 
@@ -35,7 +35,7 @@ class GalleryTab(tk.Frame):
         self.gday_combo = combo(top, self.gday_var, [], width=14)
         self.gday_combo.pack(side="left")
         self.gday_combo.bind("<<ComboboxSelected>>", lambda e: self.render())
-        button(top, "➕  Build from check-in video…", self._open_checkin, ACCENT).pack(side="right")
+        button(top, "Build from check-in video…", self._open_checkin, ACCENT, icon="plus").pack(side="right")
         self.ginfo = tk.Label(top, text="", bg=BG, fg=FG_DIM, font=(FONT, 9), anchor="w", justify="left")
         self.ginfo.pack(side="left", padx=12, fill="x", expand=True)
 
@@ -94,8 +94,8 @@ class GalleryTab(tk.Frame):
             head = tk.Frame(card, bg=CARD)
             head.pack(fill="x", padx=10, pady=(8, 4))
             label = names.get(d.name, d.name)
-            tk.Label(head, text=label.replace("emp_", "Emp "), bg=CARD, fg=ACCENT,
-                     font=(FONT, 11, "bold")).pack(side="left")
+            tk.Label(head, text=label.replace("emp_", "Emp "), bg=CARD, fg=OK,
+                     font=(FONT_SEMI, 11)).pack(side="left")
             cut = meta.get("enroll_cutoff", {}).get(label)
             if cut:
                 tk.Label(head, text=f"enrolled until {cut[0]} f{cut[1]}", bg=CARD, fg=FG_DIM,

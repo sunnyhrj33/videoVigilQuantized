@@ -22,12 +22,13 @@ import threading
 import tkinter as tk
 from datetime import date as _date, datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
+from console.theme import dialogs as messagebox  # themed drop-in
 from typing import Optional
 
 from PIL import Image, ImageTk
 
-from console.theme import (ACCENT, BG, BORDER, CARD, CARD2, DANGER, FG, FG_DIM, FONT,
+from console.theme import (FONT_SEMI, LABEL, OK, ACCENT, BG, BORDER, CARD, CARD2, DANGER, FG, FG_DIM, FONT,
                            PANEL, WARN, ScrollFrame, button, combo)
 from core.chirla import date_in_name, is_iso_date
 from core.enrollment import (EnrollmentError, all_staff_labels, build_staff, describe_existing,
@@ -36,7 +37,7 @@ from webapp.pipeline import web_settings
 
 logger = logging.getLogger("console.checkin")
 
-STATUS_COL = {"KNOWN": ACCENT, "UNKNOWN": WARN, "SUSPECT": DANGER, "UNCLEAR": FG_DIM}
+STATUS_COL = {"KNOWN": OK, "UNKNOWN": WARN, "SUSPECT": DANGER, "UNCLEAR": FG_DIM}
 
 
 class CheckinDialog(tk.Toplevel):
@@ -71,7 +72,7 @@ class CheckinDialog(tk.Toplevel):
         f = tk.Frame(self, bg=PANEL)
         f.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
         f.columnconfigure(2, weight=1)
-        tk.Label(f, text="1 · CHECK-IN RECORDING", bg=PANEL, fg=FG_DIM, font=(FONT, 8, "bold")).grid(
+        tk.Label(f, text="1 · CHECK-IN RECORDING", bg=PANEL, fg=FG_DIM, font=LABEL).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(10, 4))
         tk.Label(f, text="Use footage from the start of the day (people change clothes between days). "
                          "Don't later test recognition on this same footage.",
@@ -87,7 +88,7 @@ class CheckinDialog(tk.Toplevel):
         self.path_entry = tk.Entry(f, textvariable=self.path_var, bg=CARD, fg=FG, insertbackground=ACCENT,
                                    bd=0, font=(FONT, 9), highlightthickness=1, highlightbackground=BORDER)
         self.path_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, ipady=4)
-        self.browse_btn = button(f, "📂 Browse…", self._browse, CARD2, fg=FG)
+        self.browse_btn = button(f, "Browse…", self._browse, icon="folder")
         self.browse_btn.grid(row=2, column=3, sticky="ew", padx=(4, 12), pady=2)
         tk.Label(f, text="Recorded on", bg=PANEL, fg=FG_DIM, font=(FONT, 9)).grid(row=3, column=1, sticky="e")
         df = tk.Frame(f, bg=PANEL)
@@ -117,7 +118,7 @@ class CheckinDialog(tk.Toplevel):
 
         bf = tk.Frame(f, bg=PANEL)
         bf.grid(row=6, column=0, columnspan=4, sticky="ew", padx=12, pady=10)
-        self.analyse_btn = button(bf, "▶  Analyse check-in", self._analyse, ACCENT)
+        self.analyse_btn = button(bf, "Analyse check-in", self._analyse, ACCENT, icon="play")
         self.analyse_btn.pack(side="left")
         self.cancel_btn = button(bf, "Cancel", self._cancel, CARD2, fg=FG, state="disabled")
         self.cancel_btn.pack(side="left", padx=6)
@@ -289,7 +290,7 @@ class CheckinDialog(tk.Toplevel):
     def _build_people(self):
         f = tk.Frame(self, bg=PANEL)
         f.grid(row=1, column=0, sticky="ew", padx=10, pady=(10, 0))
-        tk.Label(f, text="2 · LABEL THE STAFF", bg=PANEL, fg=FG_DIM, font=(FONT, 8, "bold")).pack(
+        tk.Label(f, text="2 · LABEL THE STAFF", bg=PANEL, fg=FG_DIM, font=LABEL).pack(
             anchor="w", padx=12, pady=(10, 2))
         self.people_info = tk.Label(f, text="Analyse a check-in recording first.", bg=PANEL, fg=FG_DIM,
                                     font=(FONT, 9), anchor="w", justify="left", wraplength=840)
@@ -305,7 +306,7 @@ class CheckinDialog(tk.Toplevel):
         self.fill_btn = button(bar, "Fill in recognised staff", self._fill, CARD2, fg=FG, state="disabled")
         self.fill_btn.pack(side="left")
         button(bar, "Close", self._close, CARD2, fg=FG).pack(side="right")
-        self.build_btn = button(bar, "✔  Build gallery", self._build, ACCENT, state="disabled")
+        self.build_btn = button(bar, "Build gallery", self._build, ACCENT, icon="check", state="disabled")
         self.build_btn.pack(side="right", padx=6)
 
     def _clear_people(self):
@@ -322,7 +323,7 @@ class CheckinDialog(tk.Toplevel):
         ex = self.existing
         n_ok = sum(1 for p in people if not self._problem(p))
         self.status.config(text=f"Found {len(people)} people · {n_ok} can be enrolled.",
-                           fg=ACCENT if n_ok else WARN)
+                           fg=OK if n_ok else WARN)
         if ex is None:
             info = f"No staff are enrolled for {day} yet – this creates the day's gallery."
         elif ex["unreadable"]:
@@ -366,7 +367,7 @@ class CheckinDialog(tk.Toplevel):
             text = tk.Frame(row, bg=CARD)
             text.pack(side="left", fill="x", expand=True, padx=6)
             tk.Label(text, text=f"{p['id']} · {p['name']}   [{p['cam']}]", bg=CARD,
-                     fg=STATUS_COL.get(p["status"], FG), font=(FONT, 10, "bold"), anchor="w").pack(fill="x")
+                     fg=STATUS_COL.get(p["status"], FG), font=(FONT_SEMI, 10), anchor="w").pack(fill="x")
             n = len(self._embs.get(p["id"], ()))
             tk.Label(text, text=f"Can't be enrolled: {problem}" if problem
                      else f"{p['status'].lower()} · {n} clear views · on screen {p['visible_s']} s",

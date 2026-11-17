@@ -13,7 +13,7 @@ import json
 import tkinter as tk
 from pathlib import Path
 
-from console.theme import (ACCENT, ACCENT2, BG, BORDER, CARD, CARD2, CYAN,
+from console.theme import (FONT_SEMI, LABEL, ACCENT, ACCENT2, BG, BORDER, CARD, CARD2, CYAN,
                            DANGER, FG, FG_DIM, FONT, WARN)
 
 
@@ -46,7 +46,7 @@ class EvalTab(tk.Frame):
         try:
             se = json.loads(Path("output/search_eval.json").read_text())
             ex = se.get("exclude_employees") or se.get("plain")
-            c.create_text(W - 16, 18, anchor="e", fill=CYAN, font=(FONT, 10, "bold"),
+            c.create_text(W - 16, 18, anchor="e", fill=CYAN, font=(FONT_SEMI, 10),
                           text=f"Video-wide search ({ex['queries']} visitor queries, CHIRLA GT): "
                                f"top-1 {ex['rank1']:.0%} · top-5 {ex['top5']:.0%} · mAP {ex['mAP']:.0%}")
             c.create_text(W - 16, 42, anchor="e", fill=FG_DIM, font=(FONT, 9),
@@ -74,9 +74,9 @@ class EvalTab(tk.Frame):
         for i, (key, title, higher) in enumerate(panels):
             x0 = 16 + i * pw
             c.create_rectangle(x0 + 4, top, x0 + pw - 4, bottom + 46, fill=CARD, outline=BORDER)
-            c.create_text(x0 + 16, top + 16, anchor="w", text=title, fill=FG, font=(FONT, 10, "bold"))
+            c.create_text(x0 + 16, top + 16, anchor="w", text=title, fill=FG, font=(FONT_SEMI, 10))
             c.create_text(x0 + pw - 16, top + 16, anchor="e", fill=ACCENT if higher else WARN,
-                          font=(FONT, 9, "bold"), text="higher is better ↑" if higher else "lower is better ↓")
+                          font=(FONT_SEMI, 9), text="higher is better ↑" if higher else "lower is better ↓")
             chart_top, chart_bot = top + 44, bottom
             bw = (pw - 40) / max(len(methods), 1)
             for j, (name, mm, col) in enumerate(methods):
@@ -86,7 +86,7 @@ class EvalTab(tk.Frame):
                 by = chart_bot - (chart_bot - chart_top - 20) * v
                 c.create_rectangle(bx0, chart_top + 20, bx1, chart_bot, fill=CARD2, outline="")
                 c.create_rectangle(bx0, by, bx1, chart_bot, fill=col, outline="")
-                c.create_text((bx0 + bx1) / 2, by - 9, text=f"{v:.0%}", fill=FG, font=(FONT, 9, "bold"))
+                c.create_text((bx0 + bx1) / 2, by - 9, text=f"{v:.0%}", fill=FG, font=(FONT_SEMI, 9))
                 c.create_text((bx0 + bx1) / 2, chart_bot + 20, text=name, fill=FG_DIM,
                               font=(FONT, 7), justify="center")
 
@@ -104,5 +104,5 @@ class EvalTab(tk.Frame):
         for i, (cap, val, col) in enumerate(cards):
             x0 = 16 + i * cw
             c.create_rectangle(x0 + 4, y, x0 + cw - 4, y + 72, fill=CARD, outline=BORDER)
-            c.create_text(x0 + 18, y + 22, anchor="w", text=cap.upper(), fill=FG_DIM, font=(FONT, 8, "bold"))
+            c.create_text(x0 + 18, y + 22, anchor="w", text=cap.upper(), fill=FG_DIM, font=LABEL)
             c.create_text(x0 + 18, y + 48, anchor="w", text=val, fill=col, font=(FONT, 15, "bold"))

@@ -151,6 +151,31 @@ class AssetDisplacementTests(unittest.TestCase):
         ev = run(m, frames)
         self.assertEqual([e.kind for e in ev].count("unknown_interaction"), 1)
 
+    def test_unknown_mover_is_blamed_even_when_employee_covers_more(self):
+        """An employee seated behind the desk covers the whole laptop; a visitor covers less of it
+        but is not staff → the visitor is the mover and the employee is reported alongside."""
+        m = monitor()
+        frames = [(LAPTOP, [])] * 10
+        for k in range(20):
+            lap = shift(LAPTOP, 5 * k)
+            emp = (lap[0] - 60, lap[1] - 200, lap[2] + 60, lap[3] + 150)          # covers all of it
+            visitor = (lap[0] + 60, lap[1] - 150, lap[2] + 120, lap[3] + 150)     # covers ~57 %
+            frames.append((lap, [(3, emp, "KNOWN", "emp_04"), (8, visitor, "UNKNOWN", None)]))
+        disp = [e for e in run(m, frames) if e.kind == "displacement"]
+        self.assertEqual(len(disp), 1)
+        self.assertEqual(disp[0].track_id, 8)
+        self.assertEqual(disp[0].others, [3])
+        self.assertEqual(m.assets[0].handler, 8)
+
+    def test_unknown_lingering_alert_fires_next_to_an_employee(self):
+        m = monitor()
+        emp, visitor = (480, 150, 740, 650), (600, 250, 760, 600)
+        ev = run(m, [(LAPTOP, [(3, emp, "KNOWN", "emp_04"), (8, visitor, "UNKNOWN", None)])] * 200)
+        alerts = [e for e in ev if e.kind == "unknown_interaction"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].track_id, 8)
+        self.assertEqual(alerts[0].others, [3])
+
     def test_auto_registration_of_still_laptop(self):
         cfg_m = monitor(monitored_zones={})
         cfg_m.configure("camera_1")

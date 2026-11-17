@@ -536,18 +536,31 @@ class DetectionEngine:
             return display_name(ident.label)
         return f"T{tid} (UNKNOWN)" if ident.status == STATUS_UNKNOWN else f"T{tid}"
 
+    def _log_others(self, ev, idents: Dict[int, Identity]) -> str:
+        """Theft-log every other person touching the asset; returns ' · also at <asset>: …'."""
+        if not ev.others:
+            return ""
+        names = []
+        for oid in ev.others:
+            other = idents.get(oid, Identity())
+            names.append(self._who(oid, other))
+            self._theft_log(oid, other, "ASSET_CONTACT", f"{ev.asset.name} {ev.kind} – also touching it")
+        return f" · also at {ev.asset.name}: {', '.join(names)}"
+
     def _on_asset_event(self, ev, idents: Dict[int, Identity], t_sec: float):
         a, tid = ev.asset, ev.track_id
         ident = idents.get(tid, Identity()) if tid is not None else Identity()
         detail = f"{a.name} Δd={ev.dist:.0f}px"
+        others = self._log_others(ev, idents) if ev.kind in ("displacement", "unknown_interaction") else ""
         if ev.kind == "displacement":
             if tid in self._suspect_of or ident.status == STATUS_UNKNOWN:
-                self._unauthorized_displacement(a, tid, ident, ev.dist, t_sec)
+                self._unauthorized_displacement(a, tid, ident, ev.dist, t_sec, others)
             elif ident.status == STATUS_KNOWN:
                 self._authorized_relocation(a, tid, ident, ev.dist)
             else:
-                self._pending_disp[tid] = (a, self._frame_idx, ev.dist)
-                self._emit("asset", f"{a.name} displaced by T{tid} ({ev.dist:.0f}px) – identifying the mover…")
+                self._pending_disp[tid] = (a, self._frame_idx, ev.dist, others)
+                self._emit("asset", f"{a.name} displaced by T{tid} ({ev.dist:.0f}px) – identifying the mover…"
+                                    f"{others}")
         elif ev.kind == "abandoned":
             x, y = (int(v) for v in centre(a.box))
             self._emit("asset", f"{a.name} ABANDONED at ({x}, {y}) by {self._who(tid, ident)}")
@@ -565,8 +578,10 @@ class DetectionEngine:
         elif ev.kind == "unknown_interaction":
             limit = self._assets.stay_limit
             self._raise_banner(f"Security Alert: Unknown Person at {a.class_name.capitalize()} > {limit:.0f}s", t_sec)
+            if others:
+                self._emit("asset", f"{self._who(tid, ident)} at {a.name}{others}")
             self._audit_log(tid, ident, "None", f"{a.class_name.capitalize()}_Unknown_Interaction")
-            self._theft_log(tid, ident, "UNAUTHORIZED_INTERACTION", a.name)
+            self._theft_log(tid, ident, "UNAUTHORIZED_INTERACTION", f"{a.name}{others}")
             if self._st.get("auto_enrol_on_interaction", True) and tid not in self._suspect_of:
                 self._enrol_suspect(tid, "unknown_interaction")
 
@@ -578,6 +593,7 @@ class DetectionEngine:
 
     def _unauthorized_displacement(self, a, tid, ident, dist, t_sec, note=""):
         self._raise_banner("CRITICAL: Unauthorized Asset Displacement", t_sec)
+        self._emit("asset", f"{a.name} moved {dist:.0f}px by {self._who(tid, ident)}{note}")
         self._audit_log(tid, ident, "None", f"{a.class_name.capitalize()}_Displaced")
         self._theft_log(tid, ident, "THEFT_ALERT", f"{a.name} Δd={dist:.0f}px{note}")
         if self._st.get("auto_enrol_unknown_movers", True) and tid not in self._suspect_of:
@@ -585,14 +601,14 @@ class DetectionEngine:
 
     def _resolve_pending_displacements(self, idents, t_sec):
         timeout = float(self._st.get("pending_timeout_seconds", 6)) * self._clock.fps
-        for tid, (a, f0, dist) in list(self._pending_disp.items()):
+        for tid, (a, f0, dist, others) in list(self._pending_disp.items()):
             ident = idents.get(tid, Identity())
             if ident.status == STATUS_KNOWN:
                 self._authorized_relocation(a, tid, ident, dist)
             elif ident.status == STATUS_UNKNOWN:
-                self._unauthorized_displacement(a, tid, ident, dist, t_sec)
+                self._unauthorized_displacement(a, tid, ident, dist, t_sec, others)
             elif self._frame_idx - f0 > timeout:
-                self._unauthorized_displacement(a, tid, ident, dist, t_sec, " (mover not identified in time)")
+                self._unauthorized_displacement(a, tid, ident, dist, t_sec, f" (mover not identified in time){others}")
             else:
                 continue
             del self._pending_disp[tid]
@@ -765,14 +781,23 @@ class DetectionEngine:
             return ident.label.replace("emp_", "Emp_")
         return "UNKNOWN" if ident.status == STATUS_UNKNOWN else "PENDING"
 
-    def _audit_log(self, tid: int, ident: Identity, zone: str = "None", asset: str = "None"):
+    def _audit_logger(self) -> AuditLogger:
         if self._audit is None:
             owner = self._shared or self
             if owner._audit is None:
                 owner._audit = AuditLogger(owner._audit_path)
             self._audit = owner._audit
-        self._audit.log(self._clock.stamp(), self._camera_id, tid, self._log_name(ident),
-                        ident.status, ident.confidence, zone, asset)
+        return self._audit
+
+    def _audit_log(self, tid: int, ident: Identity, zone: str = "None", asset: str = "None"):
+        self._audit_logger().log(self._clock.stamp(), self._camera_id, tid, self._log_name(ident),
+                                 ident.status, ident.confidence, zone, asset)
+
+    def log_operator_action(self, action: str, detail: str):
+        """Operator actions (e.g. ALERT_ACKNOWLEDGED) go into the same forensic audit CSV."""
+        with self._engine_lock:
+            self._audit_logger().log(self._clock.stamp(), self._camera_id or "—", -1, "OPERATOR",
+                                     action, 0.0, "None", detail)
 
     def _log_identity(self, tid: int, ident: Identity):
         if ident.status == STATUS_PENDING:

@@ -143,6 +143,7 @@ class SuspectGallery:
         self.prototypes.pop(sid, None)
         shutil.rmtree(self.dir / sid, ignore_errors=True)
         self._save()
+        logger.warning("Suspect %s deleted from %s", sid, self.dir)
 
     def clear(self):
         for sid in list(self.suspects):

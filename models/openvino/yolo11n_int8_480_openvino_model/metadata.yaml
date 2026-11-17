@@ -1,7 +1,7 @@
-description: Ultralytics YOLO11n model trained on /usr/src/ultralytics/ultralytics/cfg/datasets/coco.yaml
+description: Ultralytics YOLO11n model trained on /content/videovigil_work/yolo_chirla_dataset/chirla_finetune.yaml
 author: Ultralytics
-date: '2026-10-04T18:42:58.573172+05:00'
-version: 8.4.172
+date: "2026-11-17T00:44:22.686083+00:00"
+version: "8.4.215"
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
 stride: 32
@@ -93,7 +93,7 @@ names:
   78: hair drier
   79: toothbrush
 args:
-  data: output\cache\calib\chirla_calib.yaml
+  data: /content/videovigil_work/calib_set/chirla_calib.yaml
   batch: 1
   fraction: 1.0
   quantize: 8

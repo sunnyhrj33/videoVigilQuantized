@@ -19,16 +19,16 @@ import time
 import tkinter as tk
 from pathlib import Path
 from datetime import date as _date
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, simpledialog, ttk
 from typing import Optional
 
+from console.icons import icon
 from console.tabs import (AuditTab, EvalTab, GalleryTab, LiveTab, PipelineTab,
                           SearchTab, SuspectsTab)
-from console.theme import (ACCENT, ACCENT2, BG, BORDER, CARD, CARD2, CYAN,
-                           DANGER, FG, FG_DIM, FONT, IS_WIN, MONO, PANEL,
-                           PURPLE, WARN, Chip, ScrollFrame, append_text,
-                           button, clear_text, combo, labelled, section,
-                           slider)
+from console.theme import (ACCENT, BG, BG2, BORDER, CARD, DANGER, FG, FG_DIM, FG_MUTED, FONT,
+                           IS_WIN, MONO, OK, PANEL, WARN, Chip, Collapsible, ScrollFrame,
+                           append_text, apply_style, button, caption, check, clear_text, combo,
+                           dialogs as messagebox, divider, entry, labelled, note, section, slider)
 from console.worker import MultiCameraWorker, QueueLogHandler, VideoWorker, analysis_rate
 from core.chirla import date_in_name, is_iso_date
 from core.detector import get_available_trackers, get_system_spec
@@ -49,10 +49,16 @@ RATES = [("Auto", "auto"), ("All frames  (most accurate)", "all"), ("15 fps", "1
          ("5 fps", "5"), ("3 fps  (smoothest)", "3")]
 
 MODES = [
-    ("tracklet", "Tracklet  (open-set)"),
-    ("naive", "Naive  (single frame)"),
-    ("legacy", "Legacy  (runtime IDs)"),
+    ("tracklet", "Reliable  ·  several views per person"),
+    ("naive", "Fast  ·  single frame"),
+    ("legacy", "Basic  ·  session IDs, no staff list"),
 ]
+# Notebook: operator views first, setup / research views after them
+TABS = [("live", "Live Monitor", "target"), ("suspects", "Suspects", "flag"), ("search", "Video Search", "search"),
+        ("audit", "Audit Log", "list"), ("pipeline", "Pipeline", "terminal"), ("gallery", "Staff Gallery", "users"),
+        ("eval", "Evaluation", "chart")]
+RUN_STATES = {"stopped": ("■ STOPPED", FG_DIM, CARD), "loading": ("◌ LOADING", WARN, CARD),
+              "live": ("● LIVE", OK, CARD)}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s – %(message)s")
 logger = logging.getLogger("app")
@@ -65,7 +71,7 @@ class App(tk.Tk):
         super().__init__()
         self.project_dir = PROJECT_DIR
         os.chdir(self.project_dir)
-        self.title("VIDEO VIGIL — Open-Set Security Console")
+        self.title("Video Vigil — Security Console")
         self.configure(bg=BG)
         self.minsize(1200, 720)
         self.after_idle(self._maximize_window)
@@ -90,45 +96,15 @@ class App(tk.Tk):
         self._stopping = None                   # multi-camera worker still winding down
         self.checkin_busy = False               # Gallery → check-in analysis is using self.engine
 
-        self._setup_style()
+        apply_style(self)
+        self._alert_open = 0
         self._build_ui()
+        self._bind_keys()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._poll_logs()
         self._tick()
         self.after(400, self._auto_load_model)
-
-    # ── Style ─────────────────────────────────────────────────────────────────
-
-    def _setup_style(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-        s.configure(".", background=PANEL, foreground=FG, font=(FONT, 10))
-        s.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(8, 6, 8, 0))
-        s.configure("TNotebook.Tab", background=PANEL, foreground=FG_DIM, padding=(16, 7),
-                    font=(FONT, 10, "bold"), borderwidth=0)
-        s.map("TNotebook.Tab", background=[("selected", CARD2)], foreground=[("selected", ACCENT)])
-        s.configure("TCombobox", fieldbackground=CARD, background=CARD2, foreground=FG,
-                    arrowcolor=FG, bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD, padding=5)
-        s.map("TCombobox", fieldbackground=[("readonly", CARD)], foreground=[("readonly", FG)],
-              selectbackground=[("readonly", CARD)], selectforeground=[("readonly", FG)])
-        self.option_add("*TCombobox*Listbox.background", CARD)
-        self.option_add("*TCombobox*Listbox.foreground", FG)
-        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT2)
-        self.option_add("*TCombobox*Listbox.font", (FONT, 10))
-        s.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=FG,
-                    rowheight=24, borderwidth=0, font=(FONT, 9))
-        s.configure("Treeview.Heading", background=CARD2, foreground=FG_DIM, relief="flat",
-                    font=(FONT, 8, "bold"))
-        s.map("Treeview", background=[("selected", BORDER)])
-        s.map("Treeview.Heading", background=[("active", BORDER)])
-        for name, col in (("Green", ACCENT), ("Purple", PURPLE), ("Blue", ACCENT2)):
-            s.configure(f"{name}.Horizontal.TProgressbar", troughcolor=CARD, background=col,
-                        bordercolor=CARD, lightcolor=col, darkcolor=col, thickness=6)
-        s.configure("Dark.Vertical.TScrollbar", background=CARD2, troughcolor=PANEL,
-                    bordercolor=PANEL, arrowcolor=FG_DIM, lightcolor=CARD2, darkcolor=CARD2)
-        s.configure("TPanedwindow", background=BG)
-        s.configure("Dark.Horizontal.TScale", background=PANEL, troughcolor=CARD)
 
     # ── UI Construction ────────────────────────────────────────────────────────
 
@@ -143,7 +119,7 @@ class App(tk.Tk):
         self.rowconfigure(1, weight=1)
         self._build_header()
 
-        paned = ttk.PanedWindow(self, orient="vertical")
+        self._paned = paned = ttk.PanedWindow(self, orient="vertical")
         paned.grid(row=1, column=0, sticky="nsew")
         body = tk.Frame(paned, bg=BG)
         body.columnconfigure(1, weight=1)
@@ -152,7 +128,7 @@ class App(tk.Tk):
         self._build_sidebar(body)
 
         self.nb = ttk.Notebook(body)
-        self.nb.grid(row=0, column=1, sticky="nsew", padx=(0, 6), pady=(4, 0))
+        self.nb.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=(4, 0))
         self.live_tab = LiveTab(self.nb, self)
         self.suspects_tab = SuspectsTab(self.nb, self)
         self.search_tab = SearchTab(self.nb, self)
@@ -160,82 +136,96 @@ class App(tk.Tk):
         self.gallery_tab = GalleryTab(self.nb, self)
         self.eval_tab = EvalTab(self.nb, self)
         self.audit_tab = AuditTab(self.nb, self)
-
         self._tabs = {
-            "live": self.live_tab,
-            "suspects": self.suspects_tab,
-            "search": self.search_tab,
-            "pipeline": self.pipeline_tab,
-            "gallery": self.gallery_tab,
-            "eval": self.eval_tab,
+            "live": self.live_tab, "suspects": self.suspects_tab, "search": self.search_tab,
+            "pipeline": self.pipeline_tab, "gallery": self.gallery_tab, "eval": self.eval_tab,
             "audit": self.audit_tab,
         }
-        self.nb.add(self.live_tab, text="  ◉  Live Monitor  ")
-        self.nb.add(self.suspects_tab, text="  🕵  Suspects  ")
-        self.nb.add(self.search_tab, text="  🔎  Video Search  ")
-        self.nb.add(self.pipeline_tab, text="  ⚙  Pipeline  ")
-        self.nb.add(self.gallery_tab, text="  👥  Gallery  ")
-        self.nb.add(self.eval_tab, text="  📊  Evaluation  ")
-        self.nb.add(self.audit_tab, text="  🧾  Audit Log  ")
+        for key, text, icon_name in TABS:
+            self.nb.add(self._tabs[key], text=f" {text} ", image=icon(icon_name, FG_DIM, 16), compound="left")
         self.nb.bind("<<NotebookTabChanged>>", lambda e: self._on_tab())
 
-        log_frame = tk.Frame(paned, bg=PANEL)
-        paned.add(log_frame, weight=1)
-        self._build_log_panel(log_frame)
+        self._log_frame = tk.Frame(paned, bg=BG2)
+        paned.add(self._log_frame, weight=1)
+        self._build_log_panel(self._log_frame)
 
         bar = tk.Frame(self, bg=PANEL)
         bar.grid(row=2, column=0, sticky="ew")
+        divider(bar, edge="top")
         self._status_var = tk.StringVar(value="Starting …")
         tk.Label(bar, textvariable=self._status_var, bg=PANEL, fg=FG_DIM, font=(FONT, 9),
-                 anchor="w", padx=14, pady=4).pack(side="left", fill="x", expand=True)
+                 anchor="w", padx=14, pady=5).pack(side="left", fill="x", expand=True)
         spec = self.system_spec
-        tk.Label(bar, text=f"CPU {spec.cpu_cores} cores · RAM {spec.total_ram_gb:.0f} GB · "
-                           f"GPU {spec.gpu_name if spec.has_gpu else 'none'}",
-                 bg=PANEL, fg=FG_DIM, font=(FONT, 9), padx=14).pack(side="right")
+        caption(bar, f"CPU {spec.cpu_cores} cores · RAM {spec.total_ram_gb:.0f} GB · "
+                     f"GPU {spec.gpu_name if spec.has_gpu else 'none'}", bg=PANEL, padx=14).pack(side="right")
+        caption(bar, "Space start/stop · A acknowledge · Esc back · Ctrl+L log · F11 full screen",
+                bg=PANEL, padx=14).pack(side="right")
 
     def _build_header(self):
-        hdr = tk.Frame(self, bg=PANEL, height=56)
+        hdr = tk.Frame(self, bg=PANEL, height=52)
         hdr.grid(row=0, column=0, sticky="ew")
         hdr.grid_propagate(False)
         hdr.columnconfigure(1, weight=1)
+        hdr.rowconfigure(0, weight=1)
         logo = tk.Frame(hdr, bg=PANEL)
-        logo.grid(row=0, column=0, sticky="w", padx=16, pady=8)
-        tk.Label(logo, text="◆ VIDEO VIGIL", bg=PANEL, fg=ACCENT, font=(FONT, 17, "bold")).pack(side="left")
-        tk.Label(logo, text="  open-set security console",
-                 bg=PANEL, fg=FG_DIM, font=(FONT, 10)).pack(side="left", pady=(5, 0))
+        logo.grid(row=0, column=0, sticky="w", padx=16)
+        tk.Label(logo, image=icon("target", ACCENT, 20), bg=PANEL).pack(side="left", padx=(0, 8))
+        tk.Label(logo, text="VIDEO VIGIL", bg=PANEL, fg=FG, font=(FONT, 13, "bold")).pack(side="left")
+        caption(logo, "Security console", bg=PANEL).pack(side="left", padx=(12, 0), pady=(3, 0))
+        self._run_pill = Chip(logo)
+        self._run_pill.pack(side="left", padx=(20, 0))
+        self._alert_pill = Chip(logo)
+        self._alert_pill.bind("<Button-1>", lambda e: self.select_tab("live"))
+        self._alert_flash = False
 
         chips = tk.Frame(hdr, bg=PANEL)
         chips.grid(row=0, column=2, sticky="e", padx=12)
         self._chip_mode = Chip(chips, colour=ACCENT)
-        self._chip_model = Chip(chips, colour=ACCENT2)
-        self._chip_reid = Chip(chips, colour=PURPLE)
-        self._chip_gallery = Chip(chips, colour=CYAN)
+        self._chip_model = Chip(chips)
+        self._chip_reid = Chip(chips)
+        self._chip_gallery = Chip(chips)
         for c in (self._chip_mode, self._chip_model, self._chip_reid, self._chip_gallery):
-            c.pack(side="left", padx=4)
-        self._clock = tk.Label(chips, bg=PANEL, fg=FG, font=(FONT, 11, "bold"), padx=10)
+            c.pack(side="left", padx=(0, 6))
+        self._clock = tk.Label(chips, bg=PANEL, fg=FG, font=(MONO, 11), padx=8)
         self._clock.pack(side="left")
+        divider(hdr, edge="bottom")
+        self._set_run_state("stopped")
         self._refresh_chips()
 
     def _build_sidebar(self, body):
-        sf = ScrollFrame(body, bg=PANEL, width=290)
-        sf.grid(row=0, column=0, sticky="nsw")
-        sf.grid_propagate(False)
+        side = tk.Frame(body, bg=PANEL, width=300, highlightthickness=1, highlightbackground=BORDER)
+        side.grid(row=0, column=0, sticky="nsw", padx=(8, 8), pady=(8, 0))
+        side.pack_propagate(False)
+        # START / STOP stay pinned under the scrolling settings
+        ctrl = tk.Frame(side, bg=PANEL)
+        ctrl.pack(side="bottom", fill="x")
+        divider(ctrl)
+        row = tk.Frame(ctrl, bg=PANEL)
+        row.pack(fill="x", padx=16, pady=12)
+        self._start_btn = button(row, "START", self._start, ACCENT, icon="play", size=10)
+        self._start_btn.config(pady=8)
+        self._start_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._stop_btn = button(row, "STOP", self._stop, DANGER, icon="stop", size=10, state="disabled")
+        self._stop_btn.config(pady=8)
+        self._stop_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        sf = ScrollFrame(side, bg=PANEL)
+        sf.pack(side="top", fill="both", expand=True)
         sb = sf.inner
 
         # Video Source: demo clip · own video / webcam · recorded day (all cameras together)
-        section(sb, "VIDEO SOURCE")
+        caption(sb, "Video source", bg=PANEL).pack(fill="x", padx=16, pady=(14, 6))
         self._src_mode = tk.StringVar(value="video")
         mode_row = tk.Frame(sb, bg=PANEL)
         mode_row.pack(fill="x", padx=16)
         self._src_mode_buttons = {}
         for i, (key, text) in enumerate(SOURCE_MODES):
-            b = tk.Button(mode_row, text=text, bd=0, relief="flat", font=(FONT, 8, "bold"), pady=5,
-                          cursor="hand2", command=lambda k=key: self._set_source_mode(k))
-            b.grid(row=0, column=i, sticky="ew", padx=1)
+            b = button(mode_row, text, lambda k=key: self._set_source_mode(k), size=8)
+            b.config(padx=4)
+            b.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 3, 0))
             mode_row.columnconfigure(i, weight=1, uniform="src")
             self._src_mode_buttons[key] = b
         src_box = tk.Frame(sb, bg=PANEL)
-        src_box.pack(fill="x", pady=(6, 0))
+        src_box.pack(fill="x", pady=(8, 0))
         self._src_panels = {k: tk.Frame(src_box, bg=PANEL) for k, _ in SOURCE_MODES}
 
         # ··· Demo clip
@@ -244,25 +234,20 @@ class App(tk.Tk):
         self._demo_combo = combo(p, self._demo_var, [])
         self._demo_combo.pack(fill="x", padx=16)
         self._demo_combo.bind("<<ComboboxSelected>>", lambda e: self._select_demo())
-        self._demo_note = tk.Label(p, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
-                                   anchor="w", wraplength=250)
+        self._demo_note = note(p)
         self._demo_note.pack(fill="x", padx=16, pady=(4, 0))
-        button(p, "▶  Play smooth render", self._play_render, CARD2, fg=FG).pack(
-            fill="x", padx=16, pady=(6, 0))
+        button(p, "Play smooth render", self._play_render, icon="play").pack(fill="x", padx=16, pady=(6, 0))
 
         # ··· Own video or webcam (+ its recording date → that day's staff gallery; required for
         #     video files – a date in the file name is only offered as a hint)
         p = self._src_panels["video"]
         self._source_var = tk.StringVar(value="Webcam (device 0)")
-        tk.Entry(p, textvariable=self._source_var, bg=CARD, fg=FG, insertbackground=ACCENT,
-                 font=(FONT, 9), bd=0, relief="flat", highlightthickness=1,
-                 highlightbackground=BORDER, highlightcolor=ACCENT).pack(fill="x", padx=16, ipady=5)
+        entry(p, self._source_var).pack(fill="x", padx=16, ipady=5)
         row = tk.Frame(p, bg=PANEL)
         row.pack(fill="x", padx=16, pady=(6, 0))
-        button(row, "📷  Webcam", lambda: self._source_var.set("Webcam (device 0)"),
-               CARD2, fg=FG).pack(side="left", fill="x", expand=True, padx=(0, 3))
-        button(row, "📂  Browse…", self._browse_file, CARD2, fg=FG).pack(
-            side="left", fill="x", expand=True, padx=(3, 0))
+        button(row, "Webcam", lambda: self._source_var.set("Webcam (device 0)"), icon="webcam").pack(
+            side="left", fill="x", expand=True, padx=(0, 3))
+        button(row, "Browse…", self._browse_file, icon="folder").pack(side="left", fill="x", expand=True, padx=(3, 0))
         self._video_date: Optional[str] = None
         self._date_items: dict = {}
         self._date_var = tk.StringVar(value=DATE_PLACEHOLDER)
@@ -271,9 +256,8 @@ class App(tk.Tk):
         self._date_combo.bind("<<ComboboxSelected>>", lambda e: self._on_date_pick())
         self._date_hint = tk.Frame(p, bg=PANEL)
         self._date_hint.pack(fill="x", padx=16)
-        self._date_hint_btn = button(self._date_hint, "", self._use_name_date, CARD2, fg=FG)
-        self._date_note = tk.Label(p, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
-                                   anchor="w", wraplength=250)
+        self._date_hint_btn = button(self._date_hint, "", self._use_name_date)
+        self._date_note = note(p)
         self._date_note.pack(fill="x", padx=16, pady=(2, 0))
 
         # ··· Recorded day: every camera of one sequence
@@ -288,18 +272,16 @@ class App(tk.Tk):
         self._seq_combo = combo(p, self._seq_var, [])
         labelled(p, "Sequence", self._seq_combo)
         self._seq_combo.bind("<<ComboboxSelected>>", lambda e: self._update_day_note())
-        self._day_note = tk.Label(p, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
-                                  anchor="w", wraplength=250)
+        self._day_note = note(p)
         self._day_note.pack(fill="x", padx=16, pady=(2, 0))
-        button(p, "↻  Rescan recordings", self._reload_days, CARD2, fg=FG).pack(fill="x", padx=16, pady=(6, 0))
+        button(p, "Rescan recordings", self._reload_days, icon="refresh").pack(fill="x", padx=16, pady=(6, 0))
 
         # Analysis rate: accuracy ↔ smoothness (applies to all modes, live)
         self._rate_var = tk.StringVar(value=self._rate_label(self.cfg.get("video", {}).get("analysis_fps", "auto")))
         rate = combo(sb, self._rate_var, [label for label, _ in RATES])
         labelled(sb, "Analysis", rate)
         rate.bind("<<ComboboxSelected>>", lambda e: self._on_rate_changed())
-        self._rate_note = tk.Label(sb, text="", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
-                                   anchor="w", wraplength=250)
+        self._rate_note = note(sb)
         self._rate_note.pack(fill="x", padx=16, pady=(2, 0))
 
         self._reload_gallery_days()
@@ -309,50 +291,27 @@ class App(tk.Tk):
         self._set_source_mode("video")
         self._update_rate_note()
 
-        # Models (all YOLO variants + OSNet/ResNet Re-ID models + native trackers)
-        section(sb, "MODELS")
-        model_keys = list(self.cfg.get("models", {}).keys())
-        default_model = next((k for k in ("yolo11n_int8_480", "yolo11n_int8") if k in model_keys),
-                             model_keys[0] if model_keys else "")
-        self._model_var = tk.StringVar(value=default_model)
-        labelled(sb, "Detector", combo(sb, self._model_var, model_keys))
-        self._reid_model_var = tk.StringVar(value=self.cfg.get("reid", {}).get("model", REID_MODELS[0]))
-        labelled(sb, "Re-ID", combo(sb, self._reid_model_var, REID_MODELS))
-        self._tracker_var = tk.StringVar(value=self.cfg.get("tracking", {}).get("tracker", "bytetrack"))
-        labelled(sb, "Tracker", combo(sb, self._tracker_var, self._tracker_names))
-        button(sb, "⬡  Load models", self._load_model, ACCENT2).pack(fill="x", padx=16, pady=(8, 0))
+        # Asset monitoring
+        section(sb, "Asset monitoring")
+        self._assets_var = tk.BooleanVar(value=self.engine._assets.enabled)
+        check(sb, "Watch laptops and bags", self._assets_var,
+              lambda: self._for_engines(lambda e: setattr(e._assets, "enabled", self._assets_var.get()))).pack(
+            fill="x", padx=12)
+        arow = tk.Frame(sb, bg=PANEL)
+        arow.pack(fill="x", padx=16, pady=(6, 0))
+        self._draw_btn = button(arow, "Draw laptop anchor", lambda: self.live_tab.begin_anchor(self._draw_btn),
+                                icon="pencil")
+        self._draw_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        button(arow, "Clear", self._clear_anchors, icon="trash").pack(side="left")
+        note(sb, "Moving one raises a theft alert unless staff move it. Laptops that stay still are "
+                 "anchored automatically; draw a box to set one yourself.").pack(
+            fill="x", padx=16, pady=(4, 0))
 
-        # Identity mode
-        section(sb, "IDENTITY MODE")
-        self._mode_var = tk.StringVar(value=self.cfg.get("reid", {}).get("mode", "tracklet"))
-        self._mode_buttons = {}
-        for key, label in MODES:
-            b = tk.Button(sb, text=label, bd=0, relief="flat", font=(FONT, 9, "bold"), anchor="w",
-                          padx=12, pady=5, cursor="hand2", command=lambda k=key: self._set_mode(k))
-            b.pack(fill="x", padx=16, pady=1)
-            self._mode_buttons[key] = b
-        self._paint_mode_buttons()
-
-        # Detection & Identity Thresholds
-        section(sb, "DETECTION & IDENTITY THRESHOLDS")
-        det = self.cfg["detection"]
-        self._conf_var = tk.DoubleVar(value=det.get("conf_threshold", 0.35))
-        self._person_conf_var = tk.DoubleVar(value=det.get("person_conf_threshold", 0.5))
-        self._pknown_var = tk.DoubleVar(value=self.cfg["reid"].get("open_set_p_threshold", 0.5))
-        self._iou_var = tk.DoubleVar(value=det.get("iou_threshold", 0.45))
-        slider(sb, "Detector confidence (all objects)", self._conf_var, 0.05, 1.0,
-               lambda v: self._for_engines(lambda e: setattr(e, "conf", v)))
-        slider(sb, "Person confidence (hides chairs etc.)", self._person_conf_var, 0.05, 1.0,
-               lambda v: self._for_engines(lambda e: setattr(e, "person_conf", v)))
-        slider(sb, "Unknown threshold  P(Known) <", self._pknown_var, 0.05, 0.95,
-               lambda v: self._for_engines(lambda e: e.set_open_set_threshold(v)))
-        slider(sb, "IoU threshold", self._iou_var, 0.1, 1.0,
-               lambda v: self._for_engines(lambda e: setattr(e, "iou", v)))
-        tk.Label(sb, text="Person confidence = how sure YOLO is the box is a person.\n"
-                          "Unknown threshold = below this P(Known) a person is UNKNOWN.",
-                 bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left", anchor="w").pack(fill="x", padx=16)
+        # Display & detection switches
+        section(sb, "Monitoring")
         toggles = tk.Frame(sb, bg=PANEL)
-        toggles.pack(fill="x", padx=12, pady=(4, 0))
+        toggles.pack(fill="x", padx=12)
+        toggles.columnconfigure((0, 1), weight=1)
         self._trail_var = tk.BooleanVar(value=True)
         self._reid_var = tk.BooleanVar(value=True)
         self._zones_var = tk.BooleanVar(value=self.engine.zones_enabled)
@@ -360,66 +319,89 @@ class App(tk.Tk):
         for i, (text, var, cmd) in enumerate((
             ("Show trails", self._trail_var,
              lambda: self._for_engines(lambda e: setattr(e, "show_trail", self._trail_var.get()))),
-            ("Identity / Re-ID", self._reid_var, None),
+            ("Recognise people", self._reid_var,
+             lambda: self._for_engines(lambda e: setattr(e, "_reid_enabled", self._reid_var.get()))),
             ("Restricted zones", self._zones_var, self._toggle_zones),
             ("Real-time playback", self._realtime_var, self._toggle_realtime),
         )):
-            tk.Checkbutton(toggles, text=text, variable=var, bg=PANEL, fg=FG, selectcolor=CARD,
-                           activebackground=PANEL, activeforeground=ACCENT, font=(FONT, 9),
-                           cursor="hand2", command=cmd).grid(row=i // 2, column=i % 2, sticky="w", padx=2)
+            check(toggles, text, var, cmd).grid(row=i // 2, column=i % 2, sticky="w")
 
-        # Asset Monitoring
-        section(sb, "ASSET MONITORING")
-        self._assets_var = tk.BooleanVar(value=self.engine._assets.enabled)
-        tk.Checkbutton(
-            sb, text="Monitor laptops / bags (displacement → theft alert)", variable=self._assets_var,
-            bg=PANEL, fg=FG, selectcolor=CARD, activebackground=PANEL, activeforeground=ACCENT,
-            font=(FONT, 9), cursor="hand2",
-            command=lambda: self._for_engines(lambda e: setattr(e._assets, "enabled", self._assets_var.get())),
-        ).pack(anchor="w", padx=12)
-        arow = tk.Frame(sb, bg=PANEL)
-        arow.pack(fill="x", padx=16, pady=(4, 0))
-        self._draw_btn = button(arow, "✏  Draw laptop anchor",
-                                lambda: self.live_tab.begin_anchor(self._draw_btn), CARD2, fg=FG)
-        self._draw_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
-        button(arow, "Clear", self._clear_anchors, CARD2, fg=FG).pack(side="left")
-        tk.Label(sb, text="Laptops that stay still are anchored automatically; draw a box to fix an "
-                          "anchor yourself.", bg=PANEL, fg=FG_DIM, font=(FONT, 8), justify="left",
-                 wraplength=250, anchor="w").pack(fill="x", padx=16, pady=(2, 0))
+        # Advanced: models, identity method, thresholds (closed by default – operators rarely need it)
+        adv = Collapsible(sb, "Advanced", hint="models · thresholds")
+        adv.pack(fill="x", pady=(0, 12))
+        ab = adv.body
+        caption(ab, "Models", bg=PANEL).pack(fill="x", padx=16, pady=(8, 4))
+        model_keys = list(self.cfg.get("models", {}).keys())
+        default_model = next((k for k in ("yolo11n_int8_480", "yolo11n_int8") if k in model_keys),
+                             model_keys[0] if model_keys else "")
+        self._model_var = tk.StringVar(value=default_model)
+        labelled(ab, "Detector", combo(ab, self._model_var, model_keys))
+        self._reid_model_var = tk.StringVar(value=self.cfg.get("reid", {}).get("model", REID_MODELS[0]))
+        labelled(ab, "Re-ID", combo(ab, self._reid_model_var, REID_MODELS))
+        self._tracker_var = tk.StringVar(value=self.cfg.get("tracking", {}).get("tracker", "bytetrack"))
+        labelled(ab, "Tracker", combo(ab, self._tracker_var, self._tracker_names))
+        button(ab, "Load models", self._load_model, icon="layers").pack(fill="x", padx=16, pady=(8, 0))
 
-        # Start / Stop Controls
-        ctrl = tk.Frame(sb, bg=PANEL)
-        ctrl.pack(fill="x", padx=16, pady=(16, 16))
-        self._start_btn = button(ctrl, "▶  START", self._start, ACCENT)
-        self._start_btn.config(font=(FONT, 11, "bold"), pady=9)
-        self._start_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
-        self._stop_btn = button(ctrl, "■  STOP", self._stop, DANGER, state="disabled")
-        self._stop_btn.config(font=(FONT, 11, "bold"), pady=9)
-        self._stop_btn.pack(side="left", fill="x", expand=True, padx=(3, 0))
+        caption(ab, "Recognition method", bg=PANEL).pack(fill="x", padx=16, pady=(14, 4))
+        self._mode_var = tk.StringVar(value=self.cfg.get("reid", {}).get("mode", "tracklet"))
+        self._mode_buttons = {}
+        for key, label in MODES:
+            b = button(ab, label, lambda k=key: self._set_mode(k))
+            b.config(anchor="w", padx=12)
+            b.pack(fill="x", padx=16, pady=(0, 3))
+            self._mode_buttons[key] = b
+        self._paint_mode_buttons()
+
+        caption(ab, "Thresholds", bg=PANEL).pack(fill="x", padx=16, pady=(14, 0))
+        det = self.cfg["detection"]
+        self._conf_var = tk.DoubleVar(value=det.get("conf_threshold", 0.35))
+        self._person_conf_var = tk.DoubleVar(value=det.get("person_conf_threshold", 0.5))
+        self._pknown_var = tk.DoubleVar(value=self.cfg["reid"].get("open_set_p_threshold", 0.5))
+        self._iou_var = tk.DoubleVar(value=det.get("iou_threshold", 0.45))
+        slider(ab, "Detector confidence (all objects)", self._conf_var, 0.05, 1.0,
+               lambda v: self._for_engines(lambda e: setattr(e, "conf", v)))
+        slider(ab, "Person confidence (hides chairs etc.)", self._person_conf_var, 0.05, 1.0,
+               lambda v: self._for_engines(lambda e: setattr(e, "person_conf", v)))
+        slider(ab, "Staff match threshold", self._pknown_var, 0.05, 0.95,
+               lambda v: self._for_engines(lambda e: e.set_open_set_threshold(v)))
+        slider(ab, "Box overlap (IoU)", self._iou_var, 0.1, 1.0,
+               lambda v: self._for_engines(lambda e: setattr(e, "iou", v)))
+        note(ab, "Staff match threshold: below this certainty a person is shown as UNKNOWN. "
+                 "Higher = stricter.").pack(fill="x", padx=16, pady=(6, 0))
+        button(ab, "Reset to defaults", self._reset_thresholds, icon="refresh").pack(fill="x", padx=16, pady=(8, 0))
+
+    def _reset_thresholds(self):
+        det, reid = self.cfg["detection"], self.cfg["reid"]
+        for var, value, apply in (
+            (self._conf_var, det.get("conf_threshold", 0.35), lambda e, v: setattr(e, "conf", v)),
+            (self._person_conf_var, det.get("person_conf_threshold", 0.5), lambda e, v: setattr(e, "person_conf", v)),
+            (self._pknown_var, reid.get("open_set_p_threshold", 0.5), lambda e, v: e.set_open_set_threshold(v)),
+            (self._iou_var, det.get("iou_threshold", 0.45), lambda e, v: setattr(e, "iou", v)),
+        ):
+            var.set(value)
+            self._for_engines(lambda e: apply(e, value))
+        self._set_status("Thresholds reset to the config.yaml defaults")
 
     def _build_log_panel(self, frame):
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
-        hdr = tk.Frame(frame, bg=PANEL)
+        hdr = tk.Frame(frame, bg=BG2)
         hdr.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Label(hdr, text="●", bg=PANEL, fg=ACCENT, font=(FONT, 9)).pack(side="left", padx=(12, 4))
-        tk.Label(hdr, text="LIVE LOG", bg=PANEL, fg=FG_DIM, font=(FONT, 8, "bold")).pack(side="left")
+        divider(hdr, edge="top")
+        caption(hdr, "System log", bg=BG2).pack(side="left", padx=(14, 0), pady=(6, 2))
         self._autoscroll = tk.BooleanVar(value=True)
-        tk.Checkbutton(hdr, text="auto-scroll", variable=self._autoscroll, bg=PANEL, fg=FG_DIM,
-                       selectcolor=CARD, activebackground=PANEL, font=(FONT, 8)).pack(side="right", padx=8)
-        tk.Button(hdr, text="clear", command=lambda: clear_text(self._log), bg=PANEL, fg=FG_DIM,
-                  bd=0, font=(FONT, 8), cursor="hand2", activebackground=PANEL).pack(side="right")
-        self._log = tk.Text(frame, bg="#0d1119", fg="#b9c2cf", font=(MONO, 9), bd=0, height=8,
-                            highlightthickness=0, padx=10, pady=4, state="disabled", wrap="none")
-        self._log.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=(0, 4))
+        check(hdr, "Auto-scroll", self._autoscroll, bg=BG2).pack(side="right", padx=8)
+        button(hdr, "Clear", lambda: clear_text(self._log), size=8).pack(side="right", pady=(4, 2))
+        button(hdr, "Hide  ·  Ctrl+L", self._toggle_log, size=8).pack(side="right", padx=(0, 6), pady=(4, 2))
+        self._log = tk.Text(frame, bg=BG2, fg=FG_DIM, font=(MONO, 8), bd=0, height=7,
+                            highlightthickness=0, padx=14, pady=4, state="disabled", wrap="none")
+        self._log.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
         vsb = ttk.Scrollbar(frame, orient="vertical", command=self._log.yview, style="Dark.Vertical.TScrollbar")
         vsb.grid(row=1, column=1, sticky="ns", pady=(0, 4))
         self._log.configure(yscrollcommand=vsb.set)
-        for tag, col in (("time", FG_DIM), ("INFO", "#b9c2cf"), ("WARNING", WARN), ("ERROR", DANGER),
-                         ("ALERT", DANGER), ("src", ACCENT2), ("PIPE", PURPLE)):
+        for tag, col in (("time", FG_MUTED), ("INFO", FG_DIM), ("WARNING", WARN), ("ERROR", DANGER),
+                         ("ALERT", DANGER), ("src", FG_MUTED), ("PIPE", ACCENT)):
             self._log.tag_configure(tag, foreground=col)
-        self._log.tag_configure("ALERT", font=(MONO, 9, "bold"))
-
     # ── Navigation & Status ───────────────────────────────────────────────────
 
     def _set_status(self, msg: str):
@@ -427,13 +409,52 @@ class App(tk.Tk):
 
     def _refresh_chips(self):
         mode = self._mode_var.get() if hasattr(self, "_mode_var") else self.cfg["reid"].get("mode", "tracklet")
-        self._chip_mode.config(text=f"● {mode.upper()}")
+        self._chip_mode.set({"tracklet": "Reliable", "naive": "Fast", "legacy": "Basic"}.get(mode, mode))
         key = self.engine._model_key if self.engine._model is not None else None
-        self._chip_model.config(text=key or "no detector")
+        self._chip_model.set(key or "no detector", FG_DIM if key else WARN)
         ext = self.engine._reid_extractor
         backend = "OpenVINO" if ext is not None and ext._ov_model is not None else "PyTorch" if ext else "—"
-        self._chip_reid.config(text=f"{self.engine._reid_model_name or '—'} · {backend}")
-        self._chip_gallery.config(text=f"👥 {self.engine.gallery_info}")
+        self._chip_reid.set(f"{self.engine._reid_model_name or '—'} · {backend}", FG_DIM)
+        self._chip_gallery.set(f"Staff · {self.engine.gallery_info}", FG_DIM)
+
+    def _set_run_state(self, state: str):
+        text, colour, bg = RUN_STATES[state]
+        self._run_pill.set(text, colour, bg, edge=colour if state != "stopped" else None)
+
+    def on_alerts_changed(self, n_open: int):
+        """Header alert pill: visible and flashing while alerts are unacknowledged."""
+        self._alert_open = n_open
+        if n_open:
+            self._alert_pill.set(f"{n_open} open alert{'s' if n_open > 1 else ''}", FG, DANGER, edge=DANGER)
+            self._alert_pill.pack(side="left", padx=(6, 0))
+        else:
+            self._alert_pill.pack_forget()
+
+    def on_alerts_acknowledged(self, items: list):
+        texts = "; ".join(t for _, _, _, t in items)[:400]
+        self.engine.log_operator_action("ALERT_ACKNOWLEDGED", f"{len(items)} alert(s): {texts}")
+        self._set_status(f"✓ {len(items)} alert{'s' if len(items) > 1 else ''} acknowledged · logged to the audit log")
+
+    def _bind_keys(self):
+        """Global shortcuts; ignored while typing in an entry / combobox."""
+        def typing() -> bool:
+            w = self.focus_get()
+            return isinstance(w, (tk.Entry, ttk.Entry, ttk.Combobox, tk.Text, tk.Button, tk.Checkbutton))
+
+        def key(seq, fn):
+            self.bind_all(seq, lambda e: None if typing() else (fn(), "break")[1])
+
+        key("<space>", lambda: self._stop() if self._running else self._start())
+        key("<KeyPress-a>", self.live_tab.alerts.acknowledge)
+        key("<Escape>", lambda: self.live_tab.cancel_anchor() or self.live_tab.set_focus(None))
+        self.bind_all("<Control-l>", lambda e: self._toggle_log())
+        self.bind_all("<F11>", lambda e: self.attributes("-fullscreen", not self.attributes("-fullscreen")))
+
+    def _toggle_log(self):
+        if str(self._log_frame) in self._paned.panes():
+            self._paned.forget(self._log_frame)
+        else:
+            self._paned.add(self._log_frame, weight=1)
 
     def select_tab(self, name: str):
         self.nb.select(self._tabs[name])
@@ -451,7 +472,9 @@ class App(tk.Tk):
         if sig != getattr(self, "_suspect_sig", None):
             self._suspect_sig = sig
             self.search_tab.refresh_queries()
-            self.live_tab.tiles["suspects"].set(len(self.engine.suspects))
+            n = len(self.engine.suspects)
+            self.live_tab.tiles["suspects"].set(n)
+            self.nb.tab(self.suspects_tab, text=f" Suspects · {n} " if n else " Suspects ")
             if tab == "suspects":
                 self.suspects_tab.render()
         self.after(1000, self._tick)
@@ -486,6 +509,7 @@ class App(tk.Tk):
             self._stop()
         key, reid_model = self._model_var.get(), self._reid_model_var.get()
         self._set_status(f"Loading {key} + Re-ID {reid_model} …")
+        self._set_run_state("loading")
         self.update_idletasks()
         try:
             self.engine.set_reid_model(reid_model)
@@ -498,6 +522,7 @@ class App(tk.Tk):
             if not quiet:
                 messagebox.showerror("Model Error", f"Failed to load model:\n\n{exc}")
             self._set_status(f"Model load failed: {exc}")
+        self._set_run_state("stopped")
         self._refresh_chips()
         self._reload_gallery_days()      # which days are usable depends on the Re-ID model
 
@@ -510,8 +535,7 @@ class App(tk.Tk):
 
     def _paint_mode_buttons(self):
         for key, b in self._mode_buttons.items():
-            on = key == self._mode_var.get()
-            b.config(bg=ACCENT if on else CARD, fg=BG if on else FG, activebackground=ACCENT2)
+            b.set_active(key == self._mode_var.get())
 
     def _toggle_zones(self):
         self._for_engines(lambda e: setattr(e, "zones_enabled", self._zones_var.get()))
@@ -632,7 +656,7 @@ class App(tk.Tk):
         else:
             day = self._gallery_days.get(iso)
             if day and day["usable"]:
-                text, colour = f"✓ The {day['staff']} staff enrolled on {iso} will be recognised.", ACCENT
+                text, colour = f"✓ The {day['staff']} staff enrolled on {iso} will be recognised.", OK
             else:
                 why = day["problem"] if day and day.get("problem") else f"No staff are enrolled for {iso}"
                 text, colour = f"⚠ {why}. Everyone will be UNKNOWN.", WARN
@@ -678,9 +702,7 @@ class App(tk.Tk):
         self._src_mode.set(mode)
         for key, panel in self._src_panels.items():
             panel.pack_forget()
-            on = key == mode
-            self._src_mode_buttons[key].config(bg=ACCENT if on else CARD, fg=BG if on else FG,
-                                               activebackground=ACCENT2)
+            self._src_mode_buttons[key].set_active(key == mode)
         self._src_panels[mode].pack(fill="x")
         self._update_rate_note()
 
@@ -848,6 +870,11 @@ class App(tk.Tk):
 
     def play_from(self, path: str, frame: int = 0):
         if self._running:
+            if not messagebox.askyesno("Stop live monitoring?",
+                                       f"Playing {Path(path).name} stops the current monitoring session. "
+                                       "Alerts from the live source are not raised while you review.",
+                                       ok="Stop and play", cancel="Keep monitoring"):
+                return
             self._stop()
         self._set_source_mode("video")
         self._source_var.set(path)
@@ -874,6 +901,10 @@ class App(tk.Tk):
             messagebox.showinfo("Clear anchors", "Click a camera to enlarge it first, then clear its anchors.")
             return
         engine = self.active_engine()
+        if not messagebox.askyesno("Clear anchors", f"Remove every drawn laptop anchor for {engine._camera_id}? "
+                                   "Auto-detected anchors come back once the laptops are still again.",
+                                   ok="Clear anchors", cancel="Cancel", danger=True):
+            return
         engine.clear_asset_anchors()
         self._set_status(f"Drawn anchors cleared for {engine._cam_key or 'this camera'}")
 
@@ -887,6 +918,10 @@ class App(tk.Tk):
             messagebox.showinfo("Check-in running", "A morning check-in is being analysed (Gallery tab). "
                                                     "Wait for it to finish or cancel it, then press START.")
             return
+        if self.engine._model_key != self._model_var.get():
+            self._load_model()
+            if self.engine._model_key != self._model_var.get():
+                return
         self.engine._reid_enabled = self._reid_var.get()
         self.engine.show_trail = self._trail_var.get()
         if self.engine._reid_model_name != self._reid_model_var.get():
@@ -947,6 +982,7 @@ class App(tk.Tk):
         self.live_tab.clear_feed()
         self._start_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
+        self._set_run_state("live")
         self.select_tab("live")
         self._set_status(status)
         self._poll_frames()
@@ -966,6 +1002,7 @@ class App(tk.Tk):
             self._after_id = None
         self._start_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
+        self._set_run_state("stopped")
         self._set_status("Stopped.")
         self.live_tab.end_multi()
         self.live_tab.draw_placeholder()
@@ -1042,11 +1079,12 @@ class App(tk.Tk):
         self._drain_events_of(self._engines())
 
     def _drain_events_of(self, engines):
-        for engine in engines:
+        multi = len(engines) > 1 or self._last_multi is not None
+        for index, engine in enumerate(engines):
             last = self._last_event.get(id(engine), 0)
             for no, level, stamp, cam, text in engine.events_since(last):
                 last = no
-                self.live_tab.append_event(level, stamp, cam, text)
+                self.live_tab.append_event(level, stamp, cam, text, index if multi else None)
             self._last_event[id(engine)] = last
 
     def on_gallery_changed(self, day: str):
@@ -1097,6 +1135,13 @@ class App(tk.Tk):
         self._engine_pool.clear()
 
     def _on_close(self):
+        busy = [what for what, on in (
+            ("live monitoring", self._running), ("a pipeline step", self.pipeline_tab._runner.is_running),
+            ("a search index build", self.search_tab._runner.is_running), ("a check-in analysis", self.checkin_busy),
+        ) if on]
+        if busy and not messagebox.askyesno("Quit Video Vigil?", f"This stops {', '.join(busy)}.",
+                                            ok="Quit", cancel="Keep running", danger=True):
+            return
         self._stop()
         for engine in self._engine_pool:
             engine.close()

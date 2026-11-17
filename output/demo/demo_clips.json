@@ -42,29 +42,29 @@
     ]
   },
   "demo3": {
-    "file": "demo3_asset_interaction__camera_4_2023-06-08-12_29_33.mp4",
+    "file": "demo3_asset_interaction__camera_4_2023-06-08-12_29_34.mp4",
     "source": "seq_004/camera_4",
     "date": "2023-06-08",
-    "start_frame": 750,
+    "start_frame": 795,
     "frames": 750,
     "focus": "visitor 8 at laptop",
     "object_conf": 0.91,
     "suggested_zone": {
       "camera_4": [
         [
-          0.26,
+          0.275,
           0.287
         ],
         [
-          0.723,
+          0.708,
           0.287
         ],
         [
-          0.723,
+          0.708,
           0.899
         ],
         [
-          0.26,
+          0.275,
           0.899
         ]
       ]

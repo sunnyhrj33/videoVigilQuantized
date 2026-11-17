@@ -13,9 +13,10 @@ import re
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import ttk
+from console.theme import dialogs as messagebox  # themed drop-in
 
-from console.theme import (ACCENT, BG, BORDER, CARD, CARD2, CYAN, DANGER, FG,
+from console.theme import (FONT_SEMI, LABEL, MONO_SEMI, OK, ACCENT, BG, BORDER, CARD, CARD2, CYAN, DANGER, FG,
                            FG_DIM, FONT, MONO, PURPLE, WARN, append_text,
                            button, clear_text)
 from console.worker import INDEX_RE, PIPE_NOISE, PROGRESS_RE, SubprocessRunner
@@ -57,7 +58,7 @@ class PipelineTab(tk.Frame):
         tk.Label(top, text="Offline pipeline", bg=BG, fg=FG, font=(FONT, 13, "bold")).pack(side="left")
         tk.Label(top, text="   Re-ID export → daily enrollment → open-set training → demo clips",
                  bg=BG, fg=FG_DIM, font=(FONT, 9)).pack(side="left", pady=(3, 0))
-        self._run_all_btn = button(top, "▶▶  Run all steps", self.run_all, PURPLE)
+        self._run_all_btn = button(top, "Run all steps", self.run_all, ACCENT, icon="play")
         self._run_all_btn.pack(side="right")
 
         cards = tk.Frame(self, bg=BG)
@@ -69,11 +70,11 @@ class PipelineTab(tk.Frame):
             card.grid(row=0, column=i, sticky="nsew", padx=4, pady=4)
             head = tk.Frame(card, bg=CARD)
             head.pack(fill="x", padx=12, pady=(10, 2))
-            tk.Label(head, text=f" {i + 1} ", bg=PURPLE, fg=BG, font=(FONT, 10, "bold")).pack(side="left")
-            tk.Label(head, text="  " + st["title"], bg=CARD, fg=FG, font=(FONT, 11, "bold")).pack(side="left")
+            tk.Label(head, text=f" {i + 1} ", bg=PURPLE, fg=BG, font=(FONT_SEMI, 10)).pack(side="left")
+            tk.Label(head, text="  " + st["title"], bg=CARD, fg=FG, font=(FONT_SEMI, 11)).pack(side="left")
             tk.Label(card, text=st["desc"], bg=CARD, fg=FG_DIM, font=(FONT, 8), justify="left",
                      wraplength=230, anchor="w").pack(fill="x", padx=12, pady=(2, 6))
-            status = tk.Label(card, text="", bg=CARD, fg=FG_DIM, font=(FONT, 9, "bold"), anchor="w")
+            status = tk.Label(card, text="", bg=CARD, fg=FG_DIM, font=(FONT_SEMI, 9), anchor="w")
             status.pack(fill="x", padx=12)
             prog = ttk.Progressbar(card, style="Purple.Horizontal.TProgressbar", mode="determinate", maximum=100)
             prog.pack(fill="x", padx=12, pady=(4, 6))
@@ -86,7 +87,7 @@ class PipelineTab(tk.Frame):
         con.grid(row=2, column=0, sticky="nsew", padx=8, pady=(4, 8))
         con.rowconfigure(1, weight=1)
         con.columnconfigure(0, weight=1)
-        tk.Label(con, text="PIPELINE OUTPUT", bg=CARD, fg=FG_DIM, font=(FONT, 8, "bold"),
+        tk.Label(con, text="PIPELINE OUTPUT", bg=CARD, fg=FG_DIM, font=LABEL,
                  anchor="w").grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 0))
         self._console = tk.Text(con, bg="#0d1119", fg="#c8d0dc", font=(MONO, 9), bd=0,
                                 highlightthickness=0, padx=10, pady=6, state="disabled", wrap="none")
@@ -94,9 +95,9 @@ class PipelineTab(tk.Frame):
         vsb = ttk.Scrollbar(con, orient="vertical", command=self._console.yview, style="Dark.Vertical.TScrollbar")
         vsb.grid(row=1, column=1, sticky="ns", pady=6)
         self._console.configure(yscrollcommand=vsb.set)
-        for tag, col in (("ok", ACCENT), ("warn", WARN), ("err", DANGER), ("head", PURPLE), ("table", CYAN)):
+        for tag, col in (("ok", OK), ("warn", WARN), ("err", DANGER), ("head", PURPLE), ("table", CYAN)):
             self._console.tag_configure(tag, foreground=col)
-        self._console.tag_configure("head", font=(MONO, 9, "bold"))
+        self._console.tag_configure("head", font=(MONO_SEMI, 9))
 
     def terminate(self):
         self._runner.terminate()
@@ -115,7 +116,7 @@ class PipelineTab(tk.Frame):
             p = checks[key]
             if p.exists():
                 when = time.strftime("%d %b %H:%M", time.localtime(p.stat().st_mtime))
-                st["status"].config(text=f"✓ ready · {when}", fg=ACCENT)
+                st["status"].config(text=f"✓ ready · {when}", fg=OK)
                 st["prog"]["value"] = 100
             else:
                 st["status"].config(text="○ not run yet", fg=FG_DIM)
@@ -129,6 +130,10 @@ class PipelineTab(tk.Frame):
             messagebox.showinfo("Pipeline busy", "A pipeline step is already running.")
             return
         if self.app._running:
+            if not messagebox.askyesno("Stop live monitoring?", "Pipeline steps need the CPU and the models, so "
+                                       "live monitoring stops while they run.", ok="Stop and run",
+                                       cancel="Keep monitoring"):
+                return
             self.app._stop()
         self._queue = list(keys)
         self.app.select_tab("pipeline")
@@ -190,7 +195,7 @@ class PipelineTab(tk.Frame):
         st["prog"].config(mode="determinate")
         if rc == 0:
             st["prog"]["value"] = 100
-            st["status"].config(text=f"✓ done in {secs:.0f}s", fg=ACCENT)
+            st["status"].config(text=f"✓ done in {secs:.0f}s", fg=OK)
             logger.info("Pipeline step finished: %s (%.0fs)", st["title"], secs)
             self.app.on_pipeline_step_finished(key)
             self._next_step()

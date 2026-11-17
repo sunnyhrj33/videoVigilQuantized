@@ -14,7 +14,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-from console.theme import (ACCENT, BG, CARD2, DANGER, FG, FG_DIM, FONT, IS_WIN,
+from console.theme import (OK, BG, CARD2, DANGER, FG, FG_DIM, FONT, IS_WIN,
                            WARN, button, combo)
 
 
@@ -54,7 +54,7 @@ class AuditTab(tk.Frame):
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.tag_configure("alert", foreground=DANGER)
         self.tree.tag_configure("UNKNOWN", foreground=WARN)
-        self.tree.tag_configure("KNOWN", foreground=ACCENT)
+        self.tree.tag_configure("KNOWN", foreground=OK)
 
     def refresh(self, force: bool = False):
         path = Path(self.app.engine._audit_path)

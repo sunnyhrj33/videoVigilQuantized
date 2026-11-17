@@ -96,8 +96,13 @@ class VideoWorker(threading.Thread):
             ok, frame = cap.read()
             frame_no += 1
             if not ok:
-                self.out_q.put(("done", None))
-                break
+                if is_file:
+                    self.out_q.put(("done", None))
+                    break
+                cap = self._reconnect(cap)        # webcam / stream dropped: alert + retry, don't end
+                if cap is None:                   # stopped while reconnecting (old capture released)
+                    return
+                continue
             try:
                 annotated, stats = self.engine.process_frame(frame)
                 if self.out_q.qsize() < 3:
@@ -115,6 +120,29 @@ class VideoWorker(threading.Thread):
             if frame_delay > elapsed:
                 time.sleep(frame_delay - elapsed)
         cap.release()
+
+    def _send(self, item):
+        """Queue a message without blocking forever once STOP was pressed (nobody drains then)."""
+        while not self._stop_evt.is_set():
+            try:
+                self.out_q.put(item, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
+    def _reconnect(self, cap, retry_s: float = 2.0):
+        """Reopen a live source until it delivers frames again; None if stopped meanwhile."""
+        cap.release()
+        logger.warning("Camera %s lost – reconnecting", self.source)
+        self._send(("warning", f"Camera lost ({self.source}) – reconnecting every {retry_s:.0f} s"))
+        while not self._stop_evt.wait(retry_s):
+            cap = cv2.VideoCapture(self.source)
+            if cap.isOpened() and cap.grab():
+                self._send(("status", f"Camera {self.source} reconnected – monitoring resumed"))
+                logger.info("Camera %s reconnected", self.source)
+                return cap
+            cap.release()
+        return None
 
 
 def frame_step(src_fps: float, analysis_fps: Optional[float]) -> int:

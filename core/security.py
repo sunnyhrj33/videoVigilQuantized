@@ -115,6 +115,12 @@ class AssetEvent:
     track_id: Optional[int]
     kind: str          # displacement | returned | abandoned | missing | unknown_interaction
     dist: float = 0.0
+    others: List[int] = field(default_factory=list)   # other people touching the asset at that moment
+
+
+# Who is held responsible when several people touch an asset: anyone not recognised as staff
+# outranks a known employee, however much more of the asset the employee's box covers.
+CONTACT_RANK = {"UNKNOWN": 0, "PENDING": 1, "KNOWN": 2}
 
 
 class AssetMonitor:
@@ -191,15 +197,24 @@ class AssetMonitor:
         events: List[AssetEvent] = []
         for a in self.assets:
             visible = a.last_seen == frame_idx
-            toucher = max(persons, key=lambda p: overlap_ratio(p[1], a.box), default=None)
-            touching = toucher is not None and overlap_ratio(toucher[1], a.box) > self.overlap_thresh
-            if touching:
+            contacts = self.contacts(a, persons)
+            toucher = contacts[0] if contacts else None
+            if toucher is not None:
                 a.last_toucher = (toucher[0], frame_idx)
-            events += self._step(a, frame_idx, visible, toucher if touching else None, persons)
-            ev = self._interaction(a, t_sec, toucher if touching else None)
+            new = self._step(a, frame_idx, visible, toucher, persons)
+            ev = self._interaction(a, t_sec, toucher)
             if ev:
-                events.append(ev)
+                new.append(ev)
+            for e in new:
+                e.others = [p[0] for p in contacts if p[0] != e.track_id]
+            events += new
         return events
+
+    def contacts(self, a: Asset, persons) -> list:
+        """People overlapping the asset, most accountable first: non-staff before staff,
+        then by how much of the asset each one covers."""
+        touching = [p for p in persons if overlap_ratio(p[1], a.box) > self.overlap_thresh]
+        return sorted(touching, key=lambda p: (CONTACT_RANK.get(p[2], 0), -overlap_ratio(p[1], a.box)))
 
     def _associate(self, dets, frame_idx) -> set:
         """Greedy match of detections to assets: IoU with last box, else nearest centre."""

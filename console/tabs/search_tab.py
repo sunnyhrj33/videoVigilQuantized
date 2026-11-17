@@ -15,13 +15,14 @@ import time
 import tkinter as tk
 from collections import Counter
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
+from console.theme import dialogs as messagebox  # themed drop-in
 
 import cv2
 import numpy as np
 
-from console.theme import (ACCENT, ACCENT2, BG, BORDER, CARD, CARD2, FG,
-                           FG_DIM, FONT, PANEL, PURPLE, WARN, ScrollFrame,
+from console.theme import (FONT_SEMI, LABEL, OK, ACCENT, ACCENT2, BG, BORDER, CARD, CARD2, FG,
+                           FG_DIM, FONT, PANEL, WARN, ScrollFrame,
                            button, combo, photo, section, slider)
 from console.worker import INDEX_RE, SubprocessRunner
 from core import search as vs
@@ -76,8 +77,8 @@ class SearchTab(tk.Frame):
         self.emp_cb = combo(self.qbox, self.emp_var, [], 12)
         self.emp_day_cb.bind("<<ComboboxSelected>>", lambda e: self._load_employees())
         self.live_lbl = tk.Label(self.qbox, bg=PANEL, fg=FG, font=(FONT, 9), anchor="w", justify="left",
-                                 text="Select a person in Live Monitor → 🔎 Search person")
-        self.photo_btn = button(self.qbox, "📂  Choose photo…", self._choose_photo, CARD2, fg=FG)
+                                 text="Select a person in Live Monitor → Search person")
+        self.photo_btn = button(self.qbox, "Choose photo…", self._choose_photo, icon="folder")
         self.photo_lbl = tk.Label(self.qbox, bg=PANEL, fg=FG_DIM, font=(FONT, 8), anchor="w")
 
         section(p, "SEARCH IN (INDEXED RECORDINGS)", padx=14)
@@ -92,7 +93,7 @@ class SearchTab(tk.Frame):
         self.build_day = tk.StringVar()
         self.build_cb = combo(row, self.build_day, [], 12)
         self.build_cb.pack(side="left", fill="x", expand=True)
-        self.build_btn = button(row, "Index day", self._build_index, PURPLE)
+        self.build_btn = button(row, "Index day", self._build_index, icon="layers")
         self.build_btn.pack(side="left", padx=(4, 0))
         self.build_prog = ttk.Progressbar(p, style="Purple.Horizontal.TProgressbar", maximum=100)
         self.build_prog.pack(fill="x", padx=14, pady=(6, 0))
@@ -107,8 +108,8 @@ class SearchTab(tk.Frame):
         self.min_sim = tk.DoubleVar(value=float(self._vs.get("min_similarity", 0.6)))
         slider(p, "Min similarity", self.min_sim, 0.3, 0.95, None)
 
-        self.search_btn = button(p, "🔎  SEARCH", self.run_search, ACCENT)
-        self.search_btn.config(font=(FONT, 11, "bold"), pady=9)
+        self.search_btn = button(p, "Search", self.run_search, ACCENT, icon="search")
+        self.search_btn.config(font=(FONT_SEMI, 11), pady=9)
         self.search_btn.pack(fill="x", padx=14, pady=(14, 6))
         tk.Label(
             p, text="Results are ranked by appearance similarity of whole tracklets – verify them by eye. "
@@ -312,7 +313,7 @@ class SearchTab(tk.Frame):
         logger.info("Search for %s → %d results", label, len(res))
         qrow = tk.Frame(self.results.inner, bg=BG)
         qrow.pack(fill="x", padx=4, pady=(0, 6))
-        tk.Label(qrow, text="QUERY", bg=BG, fg=FG_DIM, font=(FONT, 8, "bold")).pack(side="left", padx=(0, 6))
+        tk.Label(qrow, text="QUERY", bg=BG, fg=FG_DIM, font=LABEL).pack(side="left", padx=(0, 6))
         for t in thumbs[:6]:
             ph = photo(t, (40, 80))
             self._imgs.append(ph)
@@ -338,12 +339,12 @@ class SearchTab(tk.Frame):
 
     def _result_card(self, parent, rank, r):
         e = r.entry
-        col = ACCENT if r.sim >= 0.75 else WARN if r.sim >= 0.65 else FG_DIM
+        col = OK if r.sim >= 0.75 else WARN if r.sim >= 0.65 else FG_DIM
         card = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         top = tk.Frame(card, bg=CARD)
         top.pack(fill="x", padx=8, pady=(6, 2))
-        tk.Label(top, text=f"#{rank + 1}", bg=CARD, fg=FG_DIM, font=(FONT, 9, "bold")).pack(side="left")
-        tk.Label(top, text=f"{r.sim:.2f}", bg=CARD, fg=col, font=(FONT, 11, "bold")).pack(side="right")
+        tk.Label(top, text=f"#{rank + 1}", bg=CARD, fg=FG_DIM, font=(FONT_SEMI, 9)).pack(side="left")
+        tk.Label(top, text=f"{r.sim:.2f}", bg=CARD, fg=col, font=(FONT_SEMI, 11)).pack(side="right")
         body = tk.Frame(card, bg=CARD)
         body.pack(fill="x", padx=8)
         img = cv2.imdecode(np.frombuffer(e["thumb"], np.uint8), cv2.IMREAD_COLOR)
@@ -352,8 +353,8 @@ class SearchTab(tk.Frame):
         tk.Label(body, image=ph, bg=CARD).pack(side="left")
         info = tk.Frame(body, bg=CARD)
         info.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        rows = [(f"📹 {e['camera']}", FG), (f"{e['date']}", FG_DIM), (f"🕒 {e['t0']} – {e['t1']}", FG),
-                (f"P(Known) {e['p_known']:.2f}", FG_DIM)]
+        rows = [(e["camera"], FG), (f"{e['date']}", FG_DIM), (f"{e['t0']} – {e['t1']}", FG),
+                (f"Staff certainty {e['p_known']:.2f}", FG_DIM)]
         if e.get("gt", -1) >= 0:
             rows.append((f"GT: CHIRLA id {e['gt']}", ACCENT2))
         for txt, c in rows:
@@ -364,6 +365,6 @@ class SearchTab(tk.Frame):
             bar.delete("all"),
             bar.create_rectangle(0, 0, ev.width * s, 4, fill=col, outline="")
         ))
-        button(card, "▶ Play from here", lambda: self.app.play_from(e["video"], max(0, e["f0"] - 30)),
-               CARD2, fg=FG).pack(fill="x", padx=8, pady=(0, 8))
+        button(card, "Play from here", lambda: self.app.play_from(e["video"], max(0, e["f0"] - 30)),
+               icon="play").pack(fill="x", padx=8, pady=(0, 8))
         return card
